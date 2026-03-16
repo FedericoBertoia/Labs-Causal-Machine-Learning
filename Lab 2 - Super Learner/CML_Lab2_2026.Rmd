@@ -1,0 +1,612 @@
+---
+title: "Lab 2: Super Learner"
+subtitle: "Causal Machine Learning"
+author: "Stijn Vansteelandt and Federico Bertoia, Ghent University"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## 0. Introduction
+
+The goal of this lab is to get familiar with the `SuperLearner` R package. We analyze the [Student Dropout Prediction Dataset](https://www.kaggle.com/datasets/meharshanali/student-dropout-prediction-dataset), which simulates a realistic academic environment for 10,000 students. Beyond predicting dropout (binary outcome), we also predict GPA (continuous outcome), giving us one task of each type. For a comprehensive reference on the package's functions and arguments, see the [SuperLearner documentation](https://cran.r-project.org/web/packages/SuperLearner/refman/SuperLearner.html).
+
+```{r setup-data}
+# ── Packages ──────────────────────────────────────────────────────────────────
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggcorrplot)
+library(fastDummies)
+library(SuperLearner)
+library(pROC)
+
+# ── Reproducibility ───────────────────────────────────────────────────────────
+set.seed(123)
+
+# ── Load data ─────────────────────────────────────────────────────────────────
+df_path <- "C:/Users/feder/OneDrive - UGent/Desktop/GitHub/Labs-Causal-Machine-Learning/Lab 2 - Super Learner/student_dropout_dataset_v3.csv"
+
+df <- read_csv(df_path)
+
+# Subsample for speed during this lab
+df <- slice_sample(df, n = 2000)
+
+# ── Initial inspection ────────────────────────────────────────────────────────
+glimpse(df)
+
+# ── Preprocessing ─────────────────────────────────────────────────────────────
+df <- df %>%
+  # Drop identifier and redundant columns
+  select(-Student_ID, -Semester_GPA, -CGPA) %>%
+  # Remove incomplete cases
+  drop_na()
+
+# Confirm no remaining missingness
+stopifnot(all(colSums(is.na(df)) == 0))
+```
+
+## 1. Data Visualization
+
+We begin with a visual exploration of the dataset. We first examine the distribution of categorical variables and their relationship with the binary outcome **Dropout**. We then do the same for the continuous outcome **GPA**.
+
+### 1.1 Marginal distributions of categorical variables
+
+The bar charts below show the distribution of each categorical variable in the dataset, alongside the binary target `Dropout`.
+
+```{r cat-marginal}
+df %>%
+  select(where(is.character), Dropout) %>%
+  mutate(Dropout = as.character(Dropout)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value)) +
+  geom_bar(fill = "steelblue") +
+  facet_wrap(~variable, scales = "free") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = NULL, y = "Count")
+```
+
+### 1.2 Categorical variables stratified by Dropout
+
+To assess potential predictive signal, we plot the dropout rate within each category using stacked proportion bars. Categories with large imbalances across the two `Dropout` levels are likely informative predictors.
+
+```{r cat-by-dropout}
+df %>%
+  select(where(is.character), Dropout) %>%
+  pivot_longer(cols = -Dropout, names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value, fill = factor(Dropout))) +
+  geom_bar(position = "fill") +
+  facet_wrap(~variable, scales = "free") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = NULL, y = "Dropout Rate", fill = "Dropout") +
+  scale_fill_manual(values = c("steelblue", "tomato"), labels = c("No", "Yes"))
+```
+
+### 1.3 Distribution of GPA
+
+Since GPA is our continuous outcome, we inspect its marginal distribution via a histogram overlaid with a density curve.
+
+```{r gpa-marginal}
+ggplot(df, aes(x = GPA)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 40,
+                 fill = "steelblue", alpha = 0.7) +
+  geom_density(color = "navy", linewidth = 0.8) +
+  theme_minimal() +
+  labs(x = "GPA", y = "Density")
+```
+
+### 1.4 GPA stratified by Dropout
+
+Students who drop out may have systematically lower GPAs. The overlapping density plots below let us assess this visually.
+
+```{r gpa-by-dropout}
+df %>%
+  mutate(Dropout = factor(Dropout, labels = c("No", "Yes"))) %>%
+  ggplot(aes(x = GPA, fill = Dropout, color = Dropout)) +
+  geom_density(alpha = 0.3, linewidth = 0.8) +
+  theme_minimal() +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  scale_color_manual(values = c("steelblue", "tomato")) +
+  labs(x = "GPA", y = "Density", fill = "Dropout", color = "Dropout")
+```
+
+### 1.5 GPA vs. numeric predictors
+
+A scatterplot matrix (or individual scatter plots) can reveal linear and non-linear associations between GPA and the numeric features.
+
+```{r gpa-vs-numeric}
+df %>%
+  select(where(is.numeric), -Dropout) %>%
+  pivot_longer(cols = -GPA, names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value, y = GPA)) +
+  geom_point(alpha = 0.2, size = 0.8, color = "steelblue") +
+  geom_smooth(method = "loess", se = FALSE, color = "tomato", linewidth = 0.8) +
+  facet_wrap(~variable, scales = "free_x") +
+  theme_minimal() +
+  labs(x = NULL, y = "GPA")
+```
+
+## 2. Categorical Encoding
+
+Before fitting any model, we encode categorical variables numerically. Binary variables are mapped to 0/1, ordinal variables to consecutive integers respecting their natural order, and the unordered `Department` variable is one-hot encoded (with one level dropped to avoid collinearity).
+
+```{r encoding}
+# Binary: Yes/No and Male/Female -> 0/1
+df <- df %>%
+  mutate(
+    Gender          = ifelse(Gender == "Male", 1L, 0L),
+    Internet_Access = ifelse(Internet_Access == "Yes", 1L, 0L),
+    Part_Time_Job   = ifelse(Part_Time_Job == "Yes", 1L, 0L),
+    Scholarship     = ifelse(Scholarship == "Yes", 1L, 0L)
+  )
+
+# Ordinal: factor levels -> integer (preserving order)
+df <- df %>%
+  mutate(
+    Semester = factor(Semester,
+                      levels = c("Year 1", "Year 2", "Year 3", "Year 4"),
+                      ordered = TRUE) %>% as.integer(),
+    Parental_Education = factor(Parental_Education,
+                                levels = c("None", "High School", "Bachelor", "Master", "PhD"),
+                                ordered = TRUE) %>% as.integer()
+  )
+
+# Nominal: one-hot encode Department (drop first dummy to avoid collinearity)
+df <- dummy_cols(df,
+                 select_columns          = "Department",
+                 remove_first_dummy      = TRUE,
+                 remove_selected_columns = TRUE)
+```
+
+## 3. Correlation with Outcomes
+
+We compute Pearson correlations of all predictors with each outcome separately. This gives a quick, linear summary of marginal associations.
+
+### 3.1 Correlation with Dropout
+
+```{r corr-dropout}
+df %>%
+  cor() %>%
+  as.data.frame() %>%
+  select(Dropout) %>%
+  tibble::rownames_to_column("variable") %>%
+  filter(variable != "Dropout") %>%
+  ggplot(aes(x = reorder(variable, Dropout), y = Dropout, fill = Dropout > 0)) +
+  geom_col() +
+  coord_flip() +
+  theme_minimal() +
+  scale_fill_manual(values = c("tomato", "steelblue"), labels = c("Negative", "Positive")) +
+  labs(x = NULL, y = "Correlation with Dropout", fill = "Direction")
+```
+
+### 3.2 Correlation with GPA
+
+```{r corr-gpa}
+df %>%
+  select(-Dropout) %>%
+  cor() %>%
+  as.data.frame() %>%
+  select(GPA) %>%
+  tibble::rownames_to_column("variable") %>%
+  filter(variable != "GPA") %>%
+  ggplot(aes(x = reorder(variable, GPA), y = GPA, fill = GPA > 0)) +
+  geom_col() +
+  coord_flip() +
+  theme_minimal() +
+  scale_fill_manual(values = c("tomato", "steelblue"), labels = c("Negative", "Positive")) +
+  labs(x = NULL, y = "Correlation with GPA", fill = "Direction")
+```
+
+## 4. Super Learner on the Entire Dataset
+
+As a first step, we fit the Super Learner on the full dataset without cross-fitting. This gives us in-sample performance metrics, which will later serve as a baseline to compare against the cross-validated estimates. We evaluate performance using two measures. The **MSE** estimates the expected squared difference between the predicted value and the true value — more informative for a continuous outcome. The **AUC** is the area under the ROC curve, which equals the probability that the model ranks a randomly chosen dropout student higher than a randomly chosen non-dropout student — it measures discrimination ability regardless of the chosen classification threshold.
+
+```{r list-wrappers}
+
+# --- Check available learners ---
+listWrappers()
+```
+
+### 4.1 Dropout
+
+```{r sl-full-dropout}
+# Define feature matrix
+X_dropout <- df %>% select(-Dropout)
+
+# Candidate learners
+SL.library <- c("SL.mean", "SL.glm", "SL.ranger", "SL.gam", "SL.earth")
+
+# Fit Super Learner on full data
+sl_fit_dropout <- SuperLearner(
+  Y          = df$Dropout,
+  X          = X_dropout,
+  SL.library = SL.library,
+  family     = binomial(),
+  method     = "method.NNLS",
+  cvControl  = list(V = 5)
+)
+
+sl_fit_dropout
+
+# In-sample predictions
+Y_hat_dropout <- predict(sl_fit_dropout, newdata = X_dropout)$pred
+
+# MSE
+mse_dropout <- mean((df$Dropout - Y_hat_dropout)^2)
+cat("In-sample MSE:", round(mse_dropout, 4), "\n")
+
+# AUC
+roc_dropout <- roc(df$Dropout, Y_hat_dropout)
+cat("In-sample AUC:", round(auc(roc_dropout), 4), "\n")
+
+# ROC curve
+plot(roc_dropout,
+     col         = "steelblue",
+     lwd         = 3,
+     legacy.axes = TRUE,
+     main        = paste("ROC Curve (full data) — AUC:", round(auc(roc_dropout), 4)),
+     xlab        = "False Positive Rate",
+     ylab        = "True Positive Rate")
+abline(a = 1, b = -1, lty = 2, col = "tomato", lwd = 2)
+```
+
+### 4.2 GPA
+
+We now repeat the same exercise for the continuous outcome GPA. Two adjustments are needed relative to the Dropout model. First, we use `family = gaussian()` instead of `binomial()`, since GPA is a continuous outcome — each candidate learner is now fitted as a regression model and predictions are returned on the original continuous scale rather than as probabilities. Second, AUC is no longer a meaningful performance measure as it is specific to binary classification. We replace it with the $R^2$ which captures the proportion of variance in GPA explained by the model. A value close to 1 indicates near-perfect predictions, while a value near 0 means the model does no better than always predicting the sample mean.
+
+```{r sl-full-gpa}
+# Define feature matrix
+X_gpa <- df %>% select(-Dropout, -GPA)
+
+# Fit Super Learner on full data
+sl_fit_gpa <- SuperLearner(
+  Y          = df$GPA,
+  X          = X_gpa,
+  SL.library = SL.library,
+  family     = gaussian(),
+  method     = "method.NNLS",
+  cvControl  = list(V = 5)
+)
+
+sl_fit_gpa
+
+# In-sample predictions
+Y_hat_gpa <- predict(sl_fit_gpa, newdata = X_gpa)$pred
+
+# MSE
+mse_gpa <- mean((df$GPA - Y_hat_gpa)^2)
+cat("In-sample MSE:", round(mse_gpa, 4), "\n")
+
+# R-squared
+r2_gpa <- 1 - mse_gpa / var(df$GPA)
+cat("In-sample R-squared:", round(r2_gpa, 4), "\n")
+
+# Predicted vs. actual
+plot(df$GPA, Y_hat_gpa,
+     col  = adjustcolor("steelblue", alpha.f = 0.4),
+     pch  = 16,
+     xlab = "Observed GPA",
+     ylab = "Predicted GPA",
+     main = paste("Predicted vs. Observed GPA — R2:", round(r2_gpa, 4)),
+     ylim = c(0, max(Y_hat_gpa)))
+abline(a = 0, b = 1, lty = 2, col = "tomato", lwd = 2)
+```
+
+## 5. Cross-Validated Risk of the Super Learner
+
+In Section 4 we evaluated performance on the same data used for training, which leads to optimistically biased estimates — the model has already "seen" the outcomes. To obtain honest, generalization estimates of the risk, we use `CV.SuperLearner()`, which wraps the entire Super Learner procedure in an outer cross-validation loop. In each fold, a fresh Super Learner (including its own inner cross-validation for weight estimation) is trained on the remaining data and evaluated on the held-out fold. The result is a cross-validated risk estimate for each candidate learner and for the ensemble itself, which we can compare fairly.
+
+### 5.1 Dropout
+
+```{r cv-sl-dropout}
+cv_sl_dropout <- CV.SuperLearner(
+  Y              = df$Dropout,
+  X              = X_dropout,
+  SL.library     = SL.library,
+  family         = binomial(),
+  method         = "method.NNLS",
+  cvControl      = list(V = 5),
+  innerCvControl = list(list(V = 5))
+)
+
+summary(cv_sl_dropout)
+plot(cv_sl_dropout)
+```
+
+### 5.2 GPA
+
+```{r cv-sl-gpa}
+cv_sl_gpa <- CV.SuperLearner(
+  Y              = df$GPA,
+  X              = X_gpa,
+  SL.library     = SL.library,
+  family         = gaussian(),
+  method         = "method.NNLS",
+  cvControl      = list(V = 5),
+  innerCvControl = list(list(V = 5))
+)
+
+summary(cv_sl_gpa)
+plot(cv_sl_gpa)
+```
+
+## 6. Super Learner with Cross-Fitting
+
+In Section 4 we obtained in-sample predictions, and in Section 5 we used `CV.SuperLearner()` to estimate the risk. Here we implement **cross-fitting** (also known as sample splitting) manually. The data are split into $K = 5$ folds; in each fold, the Super Learner is trained on the remaining $K-1$ folds and predictions are generated for the held-out fold. Stacking the out-of-fold predictions gives a full prediction vector that is independent of the training data used to produce it — a property that is crucial in causal machine learning as it avoids overfitting bias in downstream estimation.
+
+### 6.1 Dropout
+
+```{r cf-dropout}
+n_folds <- 5
+N       <- nrow(df)
+fold_id <- sample(rep(1:n_folds, length.out = N))
+folds   <- split(seq_len(N), fold_id)
+
+# Container for out-of-fold predictions
+Y_hat_dropout_cf <- numeric(N)
+
+for (k in 1:n_folds) {
+  
+  test  <- folds[[k]]
+  train <- setdiff(seq_len(N), test)
+  
+  sl_fit_dropout_cf <- SuperLearner(
+    Y          = df$Dropout[train],
+    X          = X_dropout[train, ],
+    SL.library = SL.library,
+    family     = binomial(),
+    method     = "method.NNLS",
+    cvControl  = list(V = 5)
+  )
+  
+  # Predict on held-out fold
+  Y_hat_dropout_cf[test] <- predict(sl_fit_dropout_cf, newdata = X_dropout[test, ])$pred
+}
+
+# MSE
+mse_dropout_cf <- mean((df$Dropout - Y_hat_dropout_cf)^2)
+cat("Cross-fitted MSE:", round(mse_dropout_cf, 4), "\n")
+
+# AUC
+roc_dropout_cf <- roc(df$Dropout, Y_hat_dropout_cf)
+cat("Cross-fitted AUC:", round(auc(roc_dropout_cf), 4), "\n")
+
+# ROC curve
+plot(roc_dropout_cf,
+     col         = "steelblue",
+     lwd         = 3,
+     legacy.axes = TRUE,
+     main        = paste("ROC Curve (cross-fitted) — AUC:", round(auc(roc_dropout_cf), 4)),
+     xlab        = "False Positive Rate",
+     ylab        = "True Positive Rate")
+abline(a = 1, b = -1, lty = 2, col = "tomato", lwd = 2)
+```
+
+### 6.2 GPA
+
+```{r cf-gpa}
+# Container for out-of-fold predictions
+Y_hat_gpa_cf <- numeric(N)
+
+for (k in 1:n_folds) {
+  
+  test  <- folds[[k]]
+  train <- setdiff(seq_len(N), test)
+  
+  sl_fit_gpa_cf <- SuperLearner(
+    Y          = df$GPA[train],
+    X          = X_gpa[train, ],
+    SL.library = SL.library,
+    family     = gaussian(),
+    method     = "method.NNLS",
+    cvControl  = list(V = 5)
+  )
+  
+  # Predict on held-out fold
+  Y_hat_gpa_cf[test] <- predict(sl_fit_gpa_cf, newdata = X_gpa[test, ])$pred
+}
+
+# MSE
+mse_gpa_cf <- mean((df$GPA - Y_hat_gpa_cf)^2)
+cat("Cross-fitted MSE:", round(mse_gpa_cf, 4), "\n")
+
+# R-squared
+r2_gpa_cf <- 1 - mse_gpa_cf / var(df$GPA)
+cat("Cross-fitted R-squared:", round(r2_gpa_cf, 4), "\n")
+
+# Predicted vs. actual
+plot(df$GPA, Y_hat_gpa_cf,
+     col  = adjustcolor("steelblue", alpha.f = 0.4),
+     pch  = 16,
+     xlab = "Observed GPA",
+     ylab = "Predicted GPA",
+     main = paste("Predicted vs. Observed GPA (cross-fitted) — R2:", round(r2_gpa_cf, 4)))
+abline(a = 0, b = 1, lty = 2, col = "tomato", lwd = 2)
+```
+
+## 7. Tuning Base Learners with `create.Learner()`
+
+So far we used default hyperparameters for each candidate learner. The `create.Learner()` function lets us expand the library by creating multiple variants of the same algorithm across a grid of hyperparameters — each variant becomes a separate candidate in the ensemble. This gives the Super Learner more flexibility: it can assign higher weight to the best-performing configuration, or blend across them.
+
+We tune two algorithms:
+
+-   **Random Forest** (`SL.ranger`): we vary `mtry` (number of features considered at each split) and `num.trees`.
+-   **MARS** (`SL.earth`): we vary `degree` (maximum interaction depth).
+
+### 7.1 Define tuned learners
+
+```{r create-learners}
+# Tuned random forests
+learners_ranger <- create.Learner(
+  "SL.ranger",
+  tune = list(
+    mtry      = floor(sqrt(ncol(X_dropout)) * c(0.5, 1, 2)),
+    num.trees = c(100, 500)
+  )
+)
+
+# Tuned MARS
+learners_earth <- create.Learner(
+  "SL.earth",
+  tune = list(
+    degree = c(1, 2)
+  )
+)
+
+# Tuned xgboost
+learners_xgboost <- create.Learner(
+  "SL.xgboost",
+  tune = list(
+    max_depth = c(2, 4, 6)
+  )
+)
+
+learners_ranger
+
+learners_earth
+
+# Expanded library
+SL.library_tuned <- c(
+  "SL.mean",
+  "SL.glm",
+  "SL.gam",
+  learners_ranger$names,
+  learners_earth$names,
+  learners_xgboost$names
+)
+
+
+cat("Candidate learners:\n")
+print(SL.library_tuned)
+```
+
+### 7.2 CV.SuperLearner — Dropout
+
+```{r cv-sl-tuned-dropout}
+cv_sl_tuned_dropout <- CV.SuperLearner(
+  Y              = df$Dropout,
+  X              = X_dropout,
+  SL.library     = SL.library_tuned,
+  family         = binomial(),
+  method         = "method.NNLS",
+  cvControl      = list(V = 5),
+  innerCvControl = list(list(V = 5))
+)
+
+summary(cv_sl_tuned_dropout)
+plot(cv_sl_tuned_dropout)
+```
+
+### 7.3 CV.SuperLearner — GPA
+
+```{r cv-sl-tuned-gpa}
+cv_sl_tuned_gpa <- CV.SuperLearner(
+  Y              = df$GPA,
+  X              = X_gpa,
+  SL.library     = SL.library_tuned,
+  family         = gaussian(),
+  method         = "method.NNLS",
+  cvControl      = list(V = 5),
+  innerCvControl = list(list(V = 5))
+)
+
+summary(cv_sl_tuned_gpa)
+plot(cv_sl_tuned_gpa)
+```
+
+## 8. Cross-Fitting with Tuned Library
+
+We now repeat the cross-fitting procedure from Section 6 using the expanded, tuned library defined in Section 7. This lets us assess whether the additional hyperparameter variants improve out-of-fold predictive performance relative to the default library.
+
+### 8.1 Dropout
+
+```{r cf-tuned-dropout}
+Y_hat_dropout_cf_tuned <- numeric(N)
+
+for (k in 1:n_folds) {
+  
+  test  <- folds[[k]]
+  train <- setdiff(seq_len(N), test)
+  
+  sl_fit <- SuperLearner(
+    Y          = df$Dropout[train],
+    X          = X_dropout[train, ],
+    SL.library = SL.library_tuned,
+    family     = binomial(),
+    method     = "method.NNLS",
+    cvControl  = list(V = 5)
+  )
+  
+  Y_hat_dropout_cf_tuned[test] <- predict(sl_fit, newdata = X_dropout[test, ])$pred
+}
+
+mse_dropout_cf_tuned <- mean((df$Dropout - Y_hat_dropout_cf_tuned)^2)
+roc_dropout_cf_tuned <- roc(df$Dropout, Y_hat_dropout_cf_tuned)
+
+cat("Cross-fitted MSE (tuned):", round(mse_dropout_cf_tuned, 4), "\n")
+cat("Cross-fitted AUC (tuned):", round(auc(roc_dropout_cf_tuned), 4), "\n")
+```
+
+### 8.2 GPA
+
+```{r cf-tuned-gpa}
+Y_hat_gpa_cf_tuned <- numeric(N)
+
+for (k in 1:n_folds) {
+  
+  test  <- folds[[k]]
+  train <- setdiff(seq_len(N), test)
+  
+  sl_fit <- SuperLearner(
+    Y          = df$GPA[train],
+    X          = X_gpa[train, ],
+    SL.library = SL.library_tuned,
+    family     = gaussian(),
+    method     = "method.NNLS",
+    cvControl  = list(V = 5)
+  )
+  
+  Y_hat_gpa_cf_tuned[test] <- predict(sl_fit, newdata = X_gpa[test, ])$pred
+}
+
+mse_gpa_cf_tuned    <- mean((df$GPA - Y_hat_gpa_cf_tuned)^2)
+r2_gpa_cf_tuned     <- 1 - mse_gpa_cf_tuned / var(df$GPA)
+
+cat("Cross-fitted MSE (tuned):", round(mse_gpa_cf_tuned, 4), "\n")
+cat("Cross-fitted R-squared (tuned):", round(r2_gpa_cf_tuned, 4), "\n")
+```
+
+### 8.3 Comparison with default library
+
+```{r cf-comparison}
+comparison <- data.frame(
+  Outcome = c("Dropout", "Dropout", "GPA", "GPA"),
+  Library = c("Default", "Tuned", "Default", "Tuned"),
+  MSE     = c(mse_dropout_cf,      mse_dropout_cf_tuned,
+              mse_gpa_cf,          mse_gpa_cf_tuned),
+  Metric2 = c(round(auc(roc_dropout_cf), 4), round(auc(roc_dropout_cf_tuned), 4),
+              r2_gpa_cf,                      r2_gpa_cf_tuned),
+  Metric2_name = c("AUC", "AUC", "R2", "R2")
+)
+
+print(comparison)
+```
+
+### Bonus
+
+```{r sl.glmnet}
+# Tuned glmnet: grid over alpha (0 = ridge, 1 = lasso, in-between = elastic net)
+# and lambda is chosen internally by glmnet via cross-validation
+learners_glmnet <- create.Learner(
+  "SL.glmnet",
+  tune = list(alpha = c(0, 0.5, 1))
+)
+
+learners_glmnet$names  # SL.glmnet_1, SL.glmnet_2, SL.glmnet_3
+```

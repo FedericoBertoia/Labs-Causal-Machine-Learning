@@ -1,0 +1,590 @@
+---
+title: "Lab 5: Average Treatment Effect"
+subtitle: "Causal Machine Learning"
+author: "Stijn Vansteelandt and Federico Bertoia, Ghent University"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## 0. Introduction
+
+The goal of this lab is to estimate the **Average Treatment Effect
+(ATE)**, defined as:
+
+$$
+E[Y^1 - Y^0],
+$$
+
+where $Y^a$ denotes the potential outcome had treatment been set to
+$A = a$. Under the standard causal assumptions of **consistency**,
+**positivity**, and **conditional exchangeability**, the ATE is
+nonparametrically identified from observed data as:
+
+$$
+\text{ATE} = E\Big[E[Y \mid A=1, X] - E[Y \mid A=0, X]\Big].
+$$
+
+We implement and compare four estimators:
+
+1.  **G-Computation**
+2.  **IPW** (Inverse Probability Weighting)
+3.  **AIPW** (Augmented IPW)
+4.  **TMLE** (Targeted Maximum Likelihood Estimation)
+
+------------------------------------------------------------------------
+
+### Data
+
+The dataset comes from an observational study conducted at Ohio Heart
+Health (1997), comprising **996 patients** who underwent Percutaneous
+Coronary Intervention (PCI). Patients received PCI either with or
+without adjunct therapy using **abciximab**, a glycoprotein IIb/IIIa
+inhibitor that reduces platelet aggregation.
+
+Importantly, abciximab was preferentially administered to **more
+severely diseased patients**, introducing *confounding* — a classic
+challenge in observational studies. All patients were followed for at
+least 6 months by the Lindner Center staff, and the binary outcome of
+interest is **survival at 6 months**.
+
+```{r setup-data}
+# ── Packages ──────────────────────────────────────────────────────────────────
+library(twang)
+library(tibble)
+library(dplyr)
+library(tidyr) 
+library(ggplot2)
+library(SuperLearner)
+library(tmle)
+
+# ── Reproducibility ───────────────────────────────────────────────────────────
+set.seed(123)
+
+# ── Load data ─────────────────────────────────────────────────────────────────
+data(lindner)
+
+lindner <- lindner %>%
+  mutate(survival_binary = ifelse(sixMonthSurvive == FALSE, 1, 0)) %>%
+  select(-sixMonthSurvive)
+
+# ── Initial inspection ────────────────────────────────────────────────────────
+glimpse(lindner)
+
+# Confirm no missing values
+stopifnot(all(colSums(is.na(lindner)) == 0))
+```
+
+## 1. Exploratory Data Analysis
+
+Before estimating the ATE, we briefly explore the data to understand the
+distribution of the treatment, outcome, and key covariates.
+
+### 1.1 Treatment and outcome distribution
+
+```{r eda-treatment-outcome}
+lindner %>%
+  count(abcix, survival_binary) %>%
+  mutate(
+    abcix           = factor(abcix, labels = c("No abciximab", "Abciximab")),
+    survival_binary = factor(survival_binary, labels = c("Survived", "Died"))
+  ) %>%
+  ggplot(aes(x = abcix, y = n, fill = survival_binary)) +
+  geom_col(position = "fill") +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  theme_minimal() +
+  labs(x = NULL, y = "Proportion", fill = "Outcome",
+       title = "Survival at 6 months by treatment group")
+```
+
+### 1.2 Covariate distributions by treatment
+
+```{r eda-covariates}
+lindner %>%
+  select(-survival_binary) %>%
+  mutate(abcix = factor(abcix, labels = c("No abciximab", "Abciximab"))) %>%
+  pivot_longer(cols = -abcix, names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value, fill = abcix, color = abcix)) +
+  geom_density(alpha = 0.3, linewidth = 0.8) +
+  facet_wrap(~variable, scales = "free") +
+  scale_fill_manual(values  = c("steelblue", "tomato")) +
+  scale_color_manual(values = c("steelblue", "tomato")) +
+  theme_minimal() +
+  labs(x = NULL, y = "Density", fill = "Treatment", color = "Treatment")
+```
+
+## 2. Unadjusted Risk Difference and Odds Ratio
+
+Before turning to causal estimators, we compute two simple unadjusted
+measures of association between treatment and outcome: the **risk
+difference** (RD) and the **odds ratio** (OR). These do not adjust for
+confounding and serve as a naive baseline.
+
+### 2.1 Risk Difference
+
+The risk difference is estimated via a linear probability model:
+
+$$ E(Y \mid A) = \alpha + \beta A $$
+
+where $\hat{\beta}$ directly estimates the risk difference
+$P(Y = 1 \mid A = 1) - P(Y = 1 \mid A = 0)$.
+
+### 2.2 Odds Ratio
+
+The odds ratio is estimated via logistic regression:
+
+$$ \text{logit}\, P(Y = 1 \mid A) = \alpha^* + \beta^* A $$
+
+The odds ratio is then recovered as:
+
+$$ \widehat{\text{OR}} = \exp(\hat{\beta}^*) = \frac{\text{odds}(Y = 1 \mid A = 1)}{\text{odds}(Y = 1 \mid A = 0)} $$
+
+```{r unadjusted}
+# ── Contingency table ─────────────────────────────────────────────────────────
+table(lindner$survival_binary, lindner$abcix)
+
+# ── Model formulas ────────────────────────────────────────────────────────────
+unadjusted <- survival_binary ~ abcix
+
+# ── Risk Difference (linear probability model) ────────────────────────────────
+lpm_fit <- lm(unadjusted, data = lindner)
+summary(lpm_fit)
+confint(lpm_fit)
+
+rd    <- coef(lpm_fit)["abcix"]
+ci_rd <- confint(lpm_fit)["abcix", ]
+
+cat("Risk Difference:", round(rd, 4), "\n")
+cat("95% CI: [", round(ci_rd[1], 4), ",", round(ci_rd[2], 4), "]\n")
+
+# ── Odds Ratio (logistic regression) ─────────────────────────────────────────
+logit_fit <- glm(unadjusted, data = lindner, family = binomial())
+summary(logit_fit)
+
+or    <- exp(coef(logit_fit)["abcix"])
+ci_or <- exp(confint(logit_fit)["abcix", ])
+
+cat("Odds Ratio:", round(or, 4), "\n")
+cat("95% CI: [", round(ci_or[1], 4), ",", round(ci_or[2], 4), "]\n")
+```
+
+## 3. Setup
+
+We define the outcome $Y$, treatment $A$, and covariate matrix $X$ used
+by all four estimators.
+
+```{r setup-estimators}
+# ── Outcome, treatment, covariates ────────────────────────────────────────────
+Y <- lindner$survival_binary
+A <- lindner$abcix
+X <- lindner %>% select(-survival_binary, -abcix)
+
+N <- nrow(lindner)
+
+# ── Candidate learners ────────────────────────────────────────────────────────
+SL.library <- c("SL.mean", "SL.glm", "SL.ranger", "SL.gam", "SL.earth")
+
+# ── Cross-fitting folds ───────────────────────────────────────────────────────
+n_folds <- 5
+fold_id <- sample(rep(1:n_folds, length.out = N))
+folds   <- split(seq_len(N), fold_id)
+```
+
+## 4. G-Computation
+
+G-Computation (also called the *substitution estimator*) proceeds in two
+steps. First, fit an outcome model
+$\hat{Q}(a, x) = \hat{E}[Y \mid A = a, X = x]$. Second, plug in $A = 1$
+and $A = 0$ for every unit and average the difference in predicted
+potential outcomes:
+
+$$
+\widehat{\text{ATE}}_{\text{G-comp}} = \frac{1}{n} \sum_{i=1}^{n} 
+\left[ \hat{Q}(1, X_i) - \hat{Q}(0, X_i) \right].
+$$
+
+### 4.1 Parametric outcome model
+
+We first fit a parametric logistic regression for $Q(a, x)$ and obtain
+the ATE by hand. Standard errors are then computed via `stdReg`, which
+uses a sandwich estimator for the variance of $\hat{E}[Y^1]$ and
+$\hat{E}[Y^0]$:
+
+$$
+\widehat{\text{var}}\left(\hat{E}[Y^1 - Y^0]\right) = 
+\widehat{\text{var}}\left(\hat{E}[Y^1]\right) + 
+\widehat{\text{var}}\left(\hat{E}[Y^0]\right) - 
+2\,\widehat{\text{cov}}\left(\hat{E}[Y^1], \hat{E}[Y^0]\right)
+$$
+
+```{r g-computation-parametric}
+# ── Model formula ─────────────────────────────────────────────────────────────
+formula_gcomp <- as.formula(paste("Y ~ A +", paste(colnames(X), collapse = " + ")))
+
+# ── Fit parametric outcome model ──────────────────────────────────────────────
+glm_Q <- glm(formula_gcomp, family = binomial(), data = data.frame(Y, A, X))
+
+# ── Predict potential outcomes by hand ───────────────────────────────────────
+dat0 <- data.frame(Y, A = 0, X)
+dat1 <- data.frame(Y, A = 1, X)
+
+Q0_par <- predict(glm_Q, newdata = dat0, type = "response")
+Q1_par <- predict(glm_Q, newdata = dat1, type = "response")
+
+ate_gcomp_par <- mean(Q1_par - Q0_par)
+cat("G-Computation ATE (parametric, by hand):", round(ate_gcomp_par, 4), "\n")
+
+# ── Standard error via stdReg (sandwich estimator) ────────────────────────────
+library(stdReg)
+fit_std <- stdGlm(fit = glm_Q, data = data.frame(Y, A, X), X = "A")
+print(summary(fit_std))
+
+ate_gcomp_par_se <- sqrt(fit_std$vcov[1] + fit_std$vcov[4] - 2 * fit_std$vcov[3])
+ci_gcomp_par    <- ate_gcomp_par + c(-1, 1) * 1.96 * ate_gcomp_par_se
+
+cat("G-Computation ATE (parametric):", round(ate_gcomp_par, 4), "\n")
+cat("SE:", round(ate_gcomp_par_se, 4), "\n")
+cat("95% CI: [", round(ci_gcomp_par[1], 4), ",", round(ci_gcomp_par[2], 4), "]\n")
+```
+
+### 4.2 Non-parametric outcome model (Super Learner)
+
+We now replace the parametric logistic regression with a Super Learner
+ensemble, which avoids model misspecification but introduces **plug-in
+bias** — nonparametric estimators converge at slower rates, making valid
+confidence intervals unavailable in this setting.
+
+```{r g-computation}
+# ── Without cross-fitting ─────────────────────────────────────────────────────
+sl_Q <- SuperLearner(
+  Y          = Y,
+  X          = data.frame(A = A, X),
+  SL.library = SL.library,
+  family     = binomial(),
+  method     = "method.NNLS",
+  cvControl  = list(V = 5)
+)
+
+Q1 <- predict(sl_Q, newdata = data.frame(A = 1, X))$pred
+Q0 <- predict(sl_Q, newdata = data.frame(A = 0, X))$pred
+
+ate_gcomp <- mean(Q1 - Q0)
+cat("G-Computation ATE (no cross-fitting):", round(ate_gcomp, 4), "\n")
+
+# ── With cross-fitting ────────────────────────────────────────────────────────
+Q1_cf <- numeric(N)
+Q0_cf <- numeric(N)
+
+for (k in 1:n_folds) {
+
+  test  <- folds[[k]]
+  train <- setdiff(seq_len(N), test)
+
+  sl_Q_cf <- SuperLearner(
+    Y          = Y[train],
+    X          = data.frame(A = A[train], X[train, ]),
+    SL.library = SL.library,
+    family     = binomial(),
+    method     = "method.NNLS",
+    cvControl  = list(V = 5)
+  )
+
+  Q1_cf[test] <- predict(sl_Q_cf, newdata = data.frame(A = 1, X[test, ]))$pred
+  Q0_cf[test] <- predict(sl_Q_cf, newdata = data.frame(A = 0, X[test, ]))$pred
+}
+
+ate_gcomp_cf <- mean(Q1_cf - Q0_cf)
+cat("G-Computation ATE (cross-fitting):", round(ate_gcomp_cf, 4), "\n")
+```
+
+## 5. IPW
+
+The Inverse Probability Weighting (IPW) estimator reweights observations
+by the inverse of their propensity score
+$\hat{\pi}(x) = \hat{P}(A = 1 \mid X = x)$, upweighting units whose
+treatment assignment was unlikely given their covariates.
+
+$$
+\widehat{\text{ATE}}_{\text{IPW}} = \frac{1}{n} \sum_{i=1}^{n}
+\left( \frac{A_i Y_i}{\hat{\pi}(X_i)} - \frac{(1-A_i) Y_i}{1 - \hat{\pi}(X_i)} \right)
+$$
+
+### 5.1 Parametric propensity score model
+
+We first estimate $\hat{\pi}(x)$ using a parametric logistic regression.
+The ATE is obtained via a weighted linear regression of $Y$ on $A$, with
+stabilized IPW weights
+$w_i = A_i / \hat{\pi}(X_i) + (1 - A_i) / (1 - \hat{\pi}(X_i))$.
+Standard errors are computed using the heteroskedasticity-consistent HC
+sandwich estimator.
+
+```{r ipw-parametric}
+# ── Fit parametric propensity score model ─────────────────────────────────────
+library(sandwich)
+
+formula_g  <- as.formula(paste("A ~", paste(colnames(X), collapse = " + ")))
+glm_pi     <- glm(formula_g, family = binomial(), data = data.frame(A, X))
+pi_hat_par <- glm_pi$fitted.values
+
+# ── Positivity check ──────────────────────────────────────────────────────────
+summary(pi_hat_par)
+
+data.frame(pi_hat = pi_hat_par, A = factor(A, labels = c("No abciximab", "Abciximab"))) %>%
+  ggplot(aes(x = pi_hat, fill = A, color = A)) +
+  geom_density(alpha = 0.3, linewidth = 0.8) +
+  scale_fill_manual(values  = c("steelblue", "tomato")) +
+  scale_color_manual(values = c("steelblue", "tomato")) +
+  theme_minimal() +
+  labs(x     = expression(hat(pi)(X)),
+       y     = "Density",
+       fill  = "Treatment",
+       color = "Treatment",
+       title = "Propensity scores by treatment group (parametric)")
+
+# ── Weighted linear regression ────────────────────────────────────────────────
+weights_par <- A / pi_hat_par + (1 - A) / (1 - pi_hat_par)
+fit_ipw_par <- lm(Y ~ A, weights = weights_par)
+
+ate_ipw_par    <- coef(fit_ipw_par)["A"]
+ate_ipw_par_se <- sqrt(vcovHC(fit_ipw_par, type = "HC")["A", "A"])
+ci_ipw_par     <- ate_ipw_par + c(-1, 1) * 1.96 * ate_ipw_par_se
+
+cat("IPW ATE (parametric, weighted regression):", round(ate_ipw_par, 4), "\n")
+cat("SE:", round(ate_ipw_par_se, 4), "\n")
+cat("95% CI: [", round(ci_ipw_par[1], 4), ",", round(ci_ipw_par[2], 4), "]\n")
+```
+
+### 5.2 Non-parametric propensity score model (Super Learner)
+
+We now replace the parametric logistic regression with a Super Learner
+ensemble. For each estimator we report both the Horvitz-Thompson
+estimator (direct plug-in) and the weighted linear regression, which
+provides standard errors via the HC sandwich estimator.
+
+```{r ipw}
+# ── Without cross-fitting ─────────────────────────────────────────────────────
+sl_pi <- SuperLearner(
+  Y          = A,
+  X          = X,
+  SL.library = SL.library,
+  family     = binomial(),
+  method     = "method.NNLS",
+  cvControl  = list(V = 5)
+)
+
+pi_hat <- predict(sl_pi, newdata = X)$pred
+
+# ── Positivity check ──────────────────────────────────────────────────────────
+summary(pi_hat)
+
+data.frame(pi_hat = pi_hat, A = factor(A, labels = c("No abciximab", "Abciximab"))) %>%
+  ggplot(aes(x = pi_hat, fill = A, color = A)) +
+  geom_density(alpha = 0.3, linewidth = 0.8) +
+  scale_fill_manual(values  = c("steelblue", "tomato")) +
+  scale_color_manual(values = c("steelblue", "tomato")) +
+  theme_minimal() +
+  labs(x     = expression(hat(pi)(X)),
+       y     = "Density",
+       fill  = "Treatment",
+       color = "Treatment",
+       title = "Propensity scores by treatment group (no cross-fitting)")
+
+# ── Horvitz-Thompson estimator ────────────────────────────────────────────────
+ipw_weights <- A / pi_hat - (1 - A) / (1 - pi_hat)
+ate_ipw     <- mean(ipw_weights * Y)
+cat("IPW ATE - Horvitz-Thompson (no cross-fitting):", round(ate_ipw, 4), "\n")
+
+# ── Weighted linear regression ────────────────────────────────────────────────
+weights_sl  <- A / pi_hat + (1 - A) / (1 - pi_hat)
+fit_ipw_sl  <- lm(Y ~ A, weights = weights_sl)
+
+ate_ipw_sl    <- coef(fit_ipw_sl)["A"]
+ate_ipw_sl_se <- sqrt(vcovHC(fit_ipw_sl, type = "HC")["A", "A"])
+ci_ipw_sl     <- ate_ipw_sl + c(-1, 1) * 1.96 * ate_ipw_sl_se
+
+cat("IPW ATE - weighted regression (no cross-fitting):", round(ate_ipw_sl, 4), "\n")
+cat("SE:", round(ate_ipw_sl_se, 4), "\n")
+cat("95% CI: [", round(ci_ipw_sl[1], 4), ",", round(ci_ipw_sl[2], 4), "]\n")
+
+# ── With cross-fitting ────────────────────────────────────────────────────────
+pi_hat_cf <- numeric(N)
+
+for (k in 1:n_folds) {
+
+  test  <- folds[[k]]
+  train <- setdiff(seq_len(N), test)
+
+  sl_pi_cf <- SuperLearner(
+    Y          = A[train],
+    X          = X[train, ],
+    SL.library = SL.library,
+    family     = binomial(),
+    method     = "method.NNLS",
+    cvControl  = list(V = 5)
+  )
+
+  pi_hat_cf[test] <- predict(sl_pi_cf, newdata = X[test, ])$pred
+}
+
+# ── Positivity check ──────────────────────────────────────────────────────────
+summary(pi_hat_cf)
+
+data.frame(pi_hat_cf = pi_hat_cf, A = factor(A, labels = c("No abciximab", "Abciximab"))) %>%
+  ggplot(aes(x = pi_hat_cf, fill = A, color = A)) +
+  geom_density(alpha = 0.3, linewidth = 0.8) +
+  scale_fill_manual(values  = c("steelblue", "tomato")) +
+  scale_color_manual(values = c("steelblue", "tomato")) +
+  theme_minimal() +
+  labs(x     = expression(hat(pi)(X)),
+       y     = "Density",
+       fill  = "Treatment",
+       color = "Treatment",
+       title = "Propensity scores by treatment group (cross-fitting)")
+
+# ── Horvitz-Thompson estimator ────────────────────────────────────────────────
+ipw_weights_cf <- A / pi_hat_cf - (1 - A) / (1 - pi_hat_cf)
+ate_ipw_cf     <- mean(ipw_weights_cf * Y)
+cat("IPW ATE - Horvitz-Thompson (cross-fitting):", round(ate_ipw_cf, 4), "\n")
+
+# ── Weighted linear regression ────────────────────────────────────────────────
+weights_sl_cf  <- A / pi_hat_cf + (1 - A) / (1 - pi_hat_cf)
+fit_ipw_sl_cf  <- lm(Y ~ A, weights = weights_sl_cf)
+
+ate_ipw_cf_sl    <- coef(fit_ipw_sl_cf)["A"]
+ate_ipw_cf_sl_se <- sqrt(vcovHC(fit_ipw_sl_cf, type = "HC")["A", "A"])
+ci_ipw_cf_sl     <- ate_ipw_cf_sl + c(-1, 1) * 1.96 * ate_ipw_cf_sl_se
+
+cat("IPW ATE - weighted regression (cross-fitting):", round(ate_ipw_cf_sl, 4), "\n")
+cat("SE:", round(ate_ipw_cf_sl_se, 4), "\n")
+cat("95% CI: [", round(ci_ipw_cf_sl[1], 4), ",", round(ci_ipw_cf_sl[2], 4), "]\n")
+```
+
+## 6. AIPW
+
+The Augmented IPW (AIPW) estimator combines the outcome model and the
+propensity score into a single *doubly robust* estimator: it remains
+consistent if either (but not necessarily both) nuisance models are
+correctly specified.
+
+$$
+\widehat{\text{ATE}}_{\text{AIPW}} = \frac{1}{n} \sum_{i=1}^{n}
+\left[
+  \hat{Q}(1, X_i) - \hat{Q}(0, X_i)
+  + \frac{A_i (Y_i - \hat{Q}(1, X_i))}{\hat{\pi}(X_i)}
+  - \frac{(1 - A_i)(Y_i - \hat{Q}(0, X_i))}{1 - \hat{\pi}(X_i)}
+\right]
+$$
+
+```{r aipw}
+# ── Without cross-fitting ─────────────────────────────────────────────────────
+aug_1    <-  A      * (Y - Q1) / pi_hat
+aug_0    <- (1 - A) * (Y - Q0) / (1 - pi_hat)
+psi_i    <- (Q1 - Q0) + aug_1 - aug_0
+ate_aipw <- mean(psi_i)
+se_aipw  <- sd(psi_i) / sqrt(N)
+ci_aipw  <- ate_aipw + c(-1, 1) * 1.96 * se_aipw
+
+cat("AIPW ATE (no cross-fitting):", round(ate_aipw, 4), "\n")
+cat("95% CI: [", round(ci_aipw[1], 4), ",", round(ci_aipw[2], 4), "]\n")
+
+# ── With cross-fitting ────────────────────────────────────────────────────────
+aug_1_cf    <-  A      * (Y - Q1_cf) / pi_hat_cf
+aug_0_cf    <- (1 - A) * (Y - Q0_cf) / (1 - pi_hat_cf)
+psi_i_cf    <- (Q1_cf - Q0_cf) + aug_1_cf - aug_0_cf
+ate_aipw_cf <- mean(psi_i_cf)
+se_aipw_cf  <- sd(psi_i_cf) / sqrt(N)
+ci_aipw_cf  <- ate_aipw_cf + c(-1, 1) * 1.96 * se_aipw_cf
+
+cat("AIPW ATE (cross-fitting):", round(ate_aipw_cf, 4), "\n")
+cat("95% CI: [", round(ci_aipw_cf[1], 4), ",", round(ci_aipw_cf[2], 4), "]\n")
+```
+
+## 7. TMLE
+
+Targeted Maximum Likelihood Estimation (TMLE) is a doubly robust
+substitution estimator. Unlike AIPW, it updates (targets) the initial
+outcome model via a fluctuation step that uses the propensity score,
+ensuring the final estimate solves the efficient score equation exactly.
+We use the `tmle` package.
+
+```{r tmle}
+# ── Without cross-fitting ─────────────────────────────────────────────────────
+tmle_fit <- tmle(
+  Y            = Y,
+  A            = A,
+  W            = as.data.frame(X),
+  Q.SL.library = SL.library,
+  g.SL.library = SL.library,
+  family       = "binomial"
+)
+
+ate_tmle <- tmle_fit$estimates$ATE$psi
+ci_tmle  <- tmle_fit$estimates$ATE$CI
+
+cat("TMLE ATE (no cross-fitting):", round(ate_tmle, 4), "\n")
+cat("95% CI: [", round(ci_tmle[1], 4), ",", round(ci_tmle[2], 4), "]\n")
+
+# ── With cross-fitting ────────────────────────────────────────────────────────
+# Supply cross-fitted nuisance estimates directly via Q and g
+tmle_fit_cf <- tmle(
+  Y            = Y,
+  A            = A,
+  W            = as.data.frame(X),
+  Q.SL.library = SL.library,
+  g.SL.library = SL.library,
+  family       = "binomial",
+  Q            = cbind(Q0_cf, Q1_cf),
+  g1W          = pi_hat_cf
+)
+
+ate_tmle_cf <- tmle_fit_cf$estimates$ATE$psi
+ci_tmle_cf  <- tmle_fit_cf$estimates$ATE$CI
+
+cat("TMLE ATE (cross-fitting):", round(ate_tmle_cf, 4), "\n")
+cat("95% CI: [", round(ci_tmle_cf[1], 4), ",", round(ci_tmle_cf[2], 4), "]\n")
+```
+
+## 8. Comparison of Estimators
+
+```{r comparison}
+results <- tibble(
+  Estimator    = c("G-Computation", "G-Computation",
+                   "IPW",           "IPW",
+                   "AIPW",          "AIPW",
+                   "TMLE",          "TMLE"),
+  Cross_fitting = rep(c("No", "Yes"), 4),
+  ATE          = c(ate_gcomp,    ate_gcomp_cf,
+                   ate_ipw,      ate_ipw_cf,
+                   ate_aipw,     ate_aipw_cf,
+                   ate_tmle,     ate_tmle_cf),
+  CI_lower     = c(NA, NA, NA, NA,
+                   ci_aipw[1],    ci_aipw_cf[1],
+                   ci_tmle[1],    ci_tmle_cf[1]),
+  CI_upper     = c(NA, NA, NA, NA,
+                   ci_aipw[2],    ci_aipw_cf[2],
+                   ci_tmle[2],    ci_tmle_cf[2])
+)
+
+print(results)
+
+# ── Forest-style plot ─────────────────────────────────────────────────────────
+results %>%
+  mutate(Estimator = factor(Estimator, levels = rev(c("G-Computation", "IPW", "AIPW", "TMLE")))) %>%
+  ggplot(aes(x = ATE, y = Estimator, color = Cross_fitting, shape = Cross_fitting)) +
+  geom_point(size = 3, position = position_dodge(width = 0.4)) +
+  geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper),
+                 height = 0.2, linewidth = 0.8,
+                 position = position_dodge(width = 0.4),
+                 na.rm = TRUE) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = c("steelblue", "tomato")) +
+  theme_minimal() +
+  labs(x = "Estimated ATE", y = NULL, color = "Cross-fitting", shape = "Cross-fitting",
+       title = "ATE estimates across estimators and cross-fitting strategies")
+```
