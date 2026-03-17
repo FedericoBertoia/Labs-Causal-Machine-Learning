@@ -52,7 +52,7 @@ Importantly, abciximab was preferentially administered to **more
 severely diseased patients**, introducing *confounding* — a classic
 challenge in observational studies. All patients were followed for at
 least 6 months by the Lindner Center staff, and the binary outcome of
-interest is **survival at 6 months**.
+interest is **survival at 6 months (0 if survived, 1 otherwise)**.
 
 ```{r setup-data}
 # ── Packages ──────────────────────────────────────────────────────────────────
@@ -72,7 +72,7 @@ data(lindner)
 
 lindner <- lindner %>%
   mutate(survival_binary = ifelse(sixMonthSurvive == FALSE, 1, 0)) %>%
-  select(-sixMonthSurvive)
+  select(-sixMonthSurvive, -lifepres)
 
 # ── Initial inspection ────────────────────────────────────────────────────────
 glimpse(lindner)
@@ -88,72 +88,102 @@ distribution of the treatment, outcome, and key covariates.
 
 ### 1.1 Treatment and outcome distribution
 
+```{r marginal distributions treatment and outcome}
+library(patchwork)
+
+p1 <- lindner %>%
+  mutate(survival_binary = factor(survival_binary, labels = c("Survived", "Died"))) %>%
+  ggplot(aes(x = survival_binary, fill = survival_binary)) +
+  geom_bar(alpha = 0.8, width = 0.4) +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  theme_minimal() +
+  labs(x = NULL, y = "Count", fill = "Outcome", title = "Outcome")
+
+p2 <- lindner %>%
+  mutate(abcix = factor(abcix, labels = c("No abciximab", "Abciximab"))) %>%
+  ggplot(aes(x = abcix, fill = abcix)) +
+  geom_bar(alpha = 0.8, width = 0.4) +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  theme_minimal() +
+  labs(x = NULL, y = "Count", fill = "Treatment", title = "Treatment")
+
+p1 + p2
+```
+
 ```{r eda-treatment-outcome}
 lindner %>%
-  count(abcix, survival_binary) %>%
   mutate(
     abcix           = factor(abcix, labels = c("No abciximab", "Abciximab")),
     survival_binary = factor(survival_binary, labels = c("Survived", "Died"))
   ) %>%
-  ggplot(aes(x = abcix, y = n, fill = survival_binary)) +
-  geom_col(position = "fill") +
+  count(abcix, survival_binary) %>%
+  group_by(abcix) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = abcix, y = prop, fill = survival_binary)) +
+  geom_col(position = "dodge", alpha = 0.8, width = 0.5) +
+  geom_text(aes(label = scales::percent(prop, accuracy = 0.1)),
+            position = position_dodge(width = 0.5), vjust = -0.5, size = 3.5) +
   scale_fill_manual(values = c("steelblue", "tomato")) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1.05)) +
   theme_minimal() +
   labs(x = NULL, y = "Proportion", fill = "Outcome",
        title = "Survival at 6 months by treatment group")
 ```
 
-### 1.2 Covariate distributions by treatment
+### 1.2 Covariate distributions 
 
 ```{r eda-covariates}
+
+cat_vars <- c("stent", "female", "diabetic", "acutemi", "ves1proc")
+
 lindner %>%
   select(-survival_binary) %>%
   mutate(abcix = factor(abcix, labels = c("No abciximab", "Abciximab"))) %>%
   pivot_longer(cols = -abcix, names_to = "variable", values_to = "value") %>%
+  mutate(is_cat = variable %in% cat_vars) %>%
   ggplot(aes(x = value, fill = abcix, color = abcix)) +
-  geom_density(alpha = 0.3, linewidth = 0.8) +
+  geom_bar(
+    data  = ~ filter(.x, is_cat),
+    fill  = "steelblue", color = "steelblue", alpha = 0.6,
+    width = 0.4
+  ) +
+  geom_density(
+    data  = ~ filter(.x, !is_cat),
+    fill  = "steelblue", color = "steelblue", alpha = 0.3, linewidth = 0.8
+  ) +
   facet_wrap(~variable, scales = "free") +
-  scale_fill_manual(values  = c("steelblue", "tomato")) +
-  scale_color_manual(values = c("steelblue", "tomato")) +
   theme_minimal() +
-  labs(x = NULL, y = "Density", fill = "Treatment", color = "Treatment")
+  labs(x = NULL, y = "Count / Density")
 ```
 
 ## 2. Unadjusted Risk Difference and Odds Ratio
 
-Before turning to causal estimators, we compute two simple unadjusted
+Before turning to "causal" estimators, we compute two simple unadjusted
 measures of association between treatment and outcome: the **risk
-difference** (RD) and the **odds ratio** (OR). These do not adjust for
-confounding and serve as a naive baseline.
+difference** (RD) and the **odds ratio** (OR).
 
 ### 2.1 Risk Difference
 
-The risk difference is estimated via a linear probability model:
+The risk difference is the difference between the risk of an outcome in
+the treated group and non treated group.
+
+$$
+E[Y \mid A=1] - E[Y \mid A=0] = P(Y=1 \mid A=1) - P(Y=1 \mid A=0)
+$$
+
+It can be estimated via a linear probability model:
 
 $$ E(Y \mid A) = \alpha + \beta A $$
 
-where $\hat{\beta}$ directly estimates the risk difference
-$P(Y = 1 \mid A = 1) - P(Y = 1 \mid A = 0)$.
+where $\hat{\beta}$ directly estimates the risk difference.
 
-### 2.2 Odds Ratio
-
-The odds ratio is estimated via logistic regression:
-
-$$ \text{logit}\, P(Y = 1 \mid A) = \alpha^* + \beta^* A $$
-
-The odds ratio is then recovered as:
-
-$$ \widehat{\text{OR}} = \exp(\hat{\beta}^*) = \frac{\text{odds}(Y = 1 \mid A = 1)}{\text{odds}(Y = 1 \mid A = 0)} $$
-
-```{r unadjusted}
-# ── Contingency table ─────────────────────────────────────────────────────────
-table(lindner$survival_binary, lindner$abcix)
+```{r risk difference}
 
 # ── Model formulas ────────────────────────────────────────────────────────────
 unadjusted <- survival_binary ~ abcix
 
 # ── Risk Difference (linear probability model) ────────────────────────────────
-lpm_fit <- lm(unadjusted, data = lindner)
+lpm_fit <- glm(unadjusted, data = lindner, family = gaussian())
 summary(lpm_fit)
 confint(lpm_fit)
 
@@ -163,6 +193,24 @@ ci_rd <- confint(lpm_fit)["abcix", ]
 cat("Risk Difference:", round(rd, 4), "\n")
 cat("95% CI: [", round(ci_rd[1], 4), ",", round(ci_rd[2], 4), "]\n")
 
+```
+
+### 2.2 Odds Ratio
+
+The odds ratio is estimated via logistic regression:
+
+$$
+\text{logit}\, P(Y = 1 \mid A) = \log \frac{P(Y=1 \mid A)}{P(Y=0 \mid A)} = \alpha^* + \beta^* A
+$$
+
+The odds ratio is then recovered as:
+
+$$
+\widehat{\text{OR}} = \frac{\color{green}{\text{odds}(Y=1 \mid A=1)}}{\color{blue}{\text{odds}(Y=1 \mid A=0)}} = \color{green}{\frac{P(Y=1 \mid A=1)}{P(Y=0 \mid A=1)}} \times \color{blue}{\frac{P(Y=0 \mid A=0)}{P(Y=1 \mid A=0)}}
+= \frac{\color{green}{\exp(\hat{\alpha}^* + \hat{\beta}^*)}}{\color{blue}{\exp(\hat{\alpha}^*)}} = \exp(\hat{\beta}^*)
+$$
+
+```{r odds ratio}
 # ── Odds Ratio (logistic regression) ─────────────────────────────────────────
 logit_fit <- glm(unadjusted, data = lindner, family = binomial())
 summary(logit_fit)
@@ -198,8 +246,7 @@ folds   <- split(seq_len(N), fold_id)
 
 ## 4. G-Computation
 
-G-Computation (also called the *substitution estimator*) proceeds in two
-steps. First, fit an outcome model
+G-Computation proceeds in two steps. First, fit an outcome model
 $\hat{Q}(a, x) = \hat{E}[Y \mid A = a, X = x]$. Second, plug in $A = 1$
 and $A = 0$ for every unit and average the difference in predicted
 potential outcomes:
@@ -245,10 +292,11 @@ library(stdReg)
 fit_std <- stdGlm(fit = glm_Q, data = data.frame(Y, A, X), X = "A")
 print(summary(fit_std))
 
+ate_gcomp_par_stdreg <- fit_std$est[2] - fit_std$est[1];
 ate_gcomp_par_se <- sqrt(fit_std$vcov[1] + fit_std$vcov[4] - 2 * fit_std$vcov[3])
 ci_gcomp_par    <- ate_gcomp_par + c(-1, 1) * 1.96 * ate_gcomp_par_se
 
-cat("G-Computation ATE (parametric):", round(ate_gcomp_par, 4), "\n")
+cat("G-Computation ATE (parametric, by stdReg):", round(ate_gcomp_par_stdreg, 4), "\n")
 cat("SE:", round(ate_gcomp_par_se, 4), "\n")
 cat("95% CI: [", round(ci_gcomp_par[1], 4), ",", round(ci_gcomp_par[2], 4), "]\n")
 ```
@@ -315,6 +363,20 @@ $$
 \left( \frac{A_i Y_i}{\hat{\pi}(X_i)} - \frac{(1-A_i) Y_i}{1 - \hat{\pi}(X_i)} \right)
 $$
 
+An alternative is the **Hájek (self-normalized) IPW estimator**, which
+normalizes the weights within each treatment arm:
+
+$$
+\widehat{\text{ATE}}_{\text{Hájek}} = \hat{E}[Y^1] - \hat{E}[Y^0] = \frac{\sum_{i=1}^{n} \frac{A_i}{\hat{\pi}(X_i)} Y_i}{\sum_{i=1}^{n} \frac{A_i}{\hat{\pi}(X_i)}} - \frac{\sum_{i=1}^{n} \frac{1-A_i}{1-\hat{\pi}(X_i)} Y_i}{\sum_{i=1}^{n} \frac{1-A_i}{1-\hat{\pi}(X_i)}}
+$$
+
+This is equivalent to a weighted linear regression of $Y$ on $A$ with
+stabilized weights
+$w_i = A_i/\hat{\pi}(X_i) + (1-A_i)/(1-\hat{\pi}(X_i))$, since `lm()`
+internally normalizes weights within each group. The Hájek estimator is
+generally preferred in finite samples as it is less sensitive to extreme
+propensity scores.
+
 ### 5.1 Parametric propensity score model
 
 We first estimate $\hat{\pi}(x)$ using a parametric logistic regression.
@@ -328,8 +390,8 @@ sandwich estimator.
 # ── Fit parametric propensity score model ─────────────────────────────────────
 library(sandwich)
 
-formula_g  <- as.formula(paste("A ~", paste(colnames(X), collapse = " + ")))
-glm_pi     <- glm(formula_g, family = binomial(), data = data.frame(A, X))
+formula_pi  <- as.formula(paste("A ~", paste(colnames(X), collapse = " + ")))
+glm_pi     <- glm(formula_pi, family = binomial(), data = data.frame(A, X))
 pi_hat_par <- glm_pi$fitted.values
 
 # ── Positivity check ──────────────────────────────────────────────────────────
@@ -481,7 +543,24 @@ $$
 \right]
 $$
 
-```{r aipw}
+### 6.1 npcausal AIPW
+
+An easy way of doing it is to use the R package npcausal
+(<https://rdrr.io/github/ehkennedy/npcausal/>). To install and load this
+package in R from GitHub, run the following commands:
+
+```         
+install.packages("devtools") library(devtools)  install_github("ehkennedy/npcausal") library(npcausal)
+```
+
+```{r npcausal aipw}
+
+
+```
+
+### 6.2 manual AIPW
+
+```{r manual aipw}
 # ── Without cross-fitting ─────────────────────────────────────────────────────
 aug_1    <-  A      * (Y - Q1) / pi_hat
 aug_0    <- (1 - A) * (Y - Q0) / (1 - pi_hat)
@@ -507,11 +586,16 @@ cat("95% CI: [", round(ci_aipw_cf[1], 4), ",", round(ci_aipw_cf[2], 4), "]\n")
 
 ## 7. TMLE
 
-Targeted Maximum Likelihood Estimation (TMLE) is a doubly robust
-substitution estimator. Unlike AIPW, it updates (targets) the initial
-outcome model via a fluctuation step that uses the propensity score,
-ensuring the final estimate solves the efficient score equation exactly.
-We use the `tmle` package.
+Targeted Maximum Likelihood Estimation (TMLE) is a doubly robust,
+asymptotically efficient substitution estimator. Rather than directly
+correcting the plug-in bias as AIPW does, TMLE updates the initial
+outcome model \$\\hat{Q}\$ through a targeted fluctuation step driven by
+the propensity score, ensuring the final estimate solves the efficient
+score equation exactly. We illustrate two implementations: the [\`tmle\`
+package]([https://cran.r-project.org/web/packages/tmle/refman/tmle.html)](https://cran.r-project.org/web/packages/tmle/refman/tmle.html))
+and a manual derivation that makes the fluctuation step explicit.
+
+### 7.1 tmle Package
 
 ```{r tmle}
 # ── Without cross-fitting ─────────────────────────────────────────────────────
@@ -548,6 +632,37 @@ ci_tmle_cf  <- tmle_fit_cf$estimates$ATE$CI
 
 cat("TMLE ATE (cross-fitting):", round(ate_tmle_cf, 4), "\n")
 cat("95% CI: [", round(ci_tmle_cf[1], 4), ",", round(ci_tmle_cf[2], 4), "]\n")
+```
+
+### 7.2 manual TMLE
+
+```{r manual tmle}
+# ── Clever Covariates ─────────────────────────────────────────────────────────
+H1 <- A / pi_hat_cf
+H0 <- (1 - A) / (1 - pi_hat_cf)
+
+# ── Estimate fluctuation parameters ──────────────────────────────────────────
+delta1 <- coef(glm(Y ~ -1 + offset(qlogis(Q1_cf)) + H1, family = binomial()))
+delta0 <- coef(glm(Y ~ -1 + offset(qlogis(Q0_cf)) + H0, family = binomial()))
+
+# ── Update initial predictions ────────────────────────────────────────────────
+Q1_cf_updated <- plogis(qlogis(Q1_cf) + delta1 / pi_hat_cf)
+Q0_cf_updated <- plogis(qlogis(Q0_cf) + delta0 / (1 - pi_hat_cf))
+
+# ── ATE estimate ──────────────────────────────────────────────────────────────
+ate_tmle_cf_manual <- mean(Q1_cf_updated - Q0_cf_updated)
+
+# ── Efficient Influence Function and standard error ───────────────────────────
+eif <- (Q1_cf_updated - Q0_cf_updated - ate_tmle_cf_manual) +
+        A / pi_hat_cf * (Y - Q1_cf_updated) -
+        (1 - A) / (1 - pi_hat_cf) * (Y - Q0_cf_updated)
+
+se_tmle_cf_manual  <- sd(eif) / sqrt(N)
+ci_tmle_cf_manual  <- ate_tmle_cf_manual + c(-1, 1) * 1.96 * se_tmle_cf_manual
+
+cat("TMLE ATE (cross-fitting, manual):", round(ate_tmle_cf_manual, 4), "\n")
+cat("SE:", round(se_tmle_cf_manual, 4), "\n")
+cat("95% CI: [", round(ci_tmle_cf_manual[1], 4), ",", round(ci_tmle_cf_manual[2], 4), "]\n")
 ```
 
 ## 8. Comparison of Estimators
@@ -587,4 +702,39 @@ results %>%
   theme_minimal() +
   labs(x = "Estimated ATE", y = NULL, color = "Cross-fitting", shape = "Cross-fitting",
        title = "ATE estimates across estimators and cross-fitting strategies")
+```
+
+## (Bonus) 9. AIPW and TMLE for ATT
+
+In this question we will repeat the same analysis for the average
+treatment effect on th treated, which is defined as:
+
+$$
+ATT = E[Y^1 - Y^0 \mid A=1],
+$$
+
+which can be nonparametrically identified from observed data as:
+
+$$
+\text{ATT} = E\Big[E[Y \mid A=1, X] - E[Y \mid A=0, X]\mid A=1\Big].
+$$
+
+### 9.1 AIPW for ATT
+
+```{r npcausal ATT}
+
+```
+
+```{r estimating equations ATT}
+
+```
+
+### 9.2 TMLE for ATT
+
+```{r tmle ATT}
+
+```
+
+```{r manual TMLE ATT}
+
 ```

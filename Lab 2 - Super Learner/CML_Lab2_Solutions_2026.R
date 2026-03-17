@@ -16,7 +16,7 @@ set.seed(123)
 
 #  Load data 
 # Set this to your local path
-df_path <- "C:/Users/feder/OneDrive - UGent/Desktop/GitHub/Labs-Causal-Machine-Learning/Lab 2 - Super Learner/student_dropout_dataset_v3.csv"
+df_path <- "C:/Users/fbertoia/OneDrive - UGent/Desktop/GitHub/Labs-Causal-Machine-Learning/Lab 2 - Super Learner/student_dropout_dataset_v3.csv"
 
 df <- read_csv(df_path)
 
