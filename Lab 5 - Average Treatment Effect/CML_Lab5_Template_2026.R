@@ -116,15 +116,18 @@ ci_rd <- confint(lpm_fit)["abcix", ]
 cat("Risk Difference:", round(rd, 4), "\n")
 cat("95% CI: [", round(ci_rd[1], 4), ",", round(ci_rd[2], 4), "]\n")
 
-# --- Odds Ratio (logistic regression) ---
-logit_fit <- glm(unadjusted, data = lindner, family = binomial())
-summary(logit_fit)
+# What does this risk difference mean? Is it a causal estimate?
 
-or    <- exp(coef(logit_fit)["abcix"])
-ci_or <- exp(confint(logit_fit)["abcix", ])
+# --- Odds Ratio (logistic regression) ---
+logit_fit <- ...
+
+or    <- ...
+ci_or <- ...
 
 cat("Odds Ratio:", round(or, 4), "\n")
 cat("95% CI: [", round(ci_or[1], 4), ",", round(ci_or[2], 4), "]\n")
+
+# Why can't we interpret the OR causally here?
 
 
 ########################
@@ -157,7 +160,7 @@ folds   <- split(seq_len(N), fold_id)
 formula_gcomp <- as.formula(paste("Y ~ A +", paste(colnames(X), collapse = " + ")))
 
 # Fit parametric outcome model
-glm_Q <- glm(formula_gcomp, family = binomial(), data = data.frame(Y, A, X))
+glm_Q <- ...
 
 # Predict potential outcomes
 dat0   <- data.frame(Y, A = 0, X)
@@ -165,7 +168,8 @@ dat1   <- data.frame(Y, A = 1, X)
 Q0_par <- predict(glm_Q, newdata = dat0, type = "response")
 Q1_par <- predict(glm_Q, newdata = dat1, type = "response")
 
-ate_gcomp_par <- mean(Q1_par - Q0_par)
+# ATE
+ate_gcomp_par <- ...
 cat("G-Computation ATE (parametric, by hand):", round(ate_gcomp_par, 4), "\n")
 
 # Standard error via stdReg (sandwich estimator)
@@ -180,8 +184,12 @@ cat("G-Computation ATE (parametric, stdReg):", round(ate_gcomp_par_stdreg, 4), "
 cat("SE:", round(ate_gcomp_par_se, 4), "\n")
 cat("95% CI: [", round(ci_gcomp_par[1], 4), ",", round(ci_gcomp_par[2], 4), "]\n")
 
+# Interpret the ATE. How does it compare to the unadjusted risk difference?
+# What are the advantages and disadvantages of using a parametric model here?
+
 # ── 4.2 Non-parametric outcome model (Super Learner) ─────────────────────────
 
+# Containers for cross-fitted predictions
 Q1 <- numeric(N)
 Q0 <- numeric(N)
 
@@ -191,8 +199,8 @@ for (k in 1:n_folds) {
   train <- setdiff(seq_len(N), test)
   
   sl_Q <- SuperLearner(
-    Y          = Y[train],
-    X          = data.frame(A = A[train], X[train, ]),
+    Y          = ...,
+    X          = ...,
     SL.library = SL.library,
     family     = binomial(),
     method     = "method.NNLS",
@@ -206,6 +214,8 @@ for (k in 1:n_folds) {
 ate_gcomp <- mean(Q1 - Q0)
 cat("G-Computation ATE (cross-fitting):", round(ate_gcomp, 4), "\n")
 
+# Can we get valid confidence intervals for this estimator?
+
 
 ########################
 # 5. IPW
@@ -215,7 +225,7 @@ cat("G-Computation ATE (cross-fitting):", round(ate_gcomp, 4), "\n")
 
 # Fit parametric propensity score model
 formula_pi <- as.formula(paste("A ~", paste(colnames(X), collapse = " + ")))
-glm_pi     <- glm(formula_pi, family = binomial(), data = data.frame(A, X))
+glm_pi     <- ...
 pi_hat_par <- glm_pi$fitted.values
 
 # Positivity check
@@ -247,8 +257,10 @@ data.frame(
   labs(x = NULL, y = "Inverse weight", fill = "Treatment",
        title = "Distribution of inverse weights by treatment group (parametric)")
 
+# Is there evidence of positivity violations? What would that imply?
+
 # Weighted linear regression (Hajek / self-normalized IPW)
-weights_par    <- A / pi_hat_par + (1 - A) / (1 - pi_hat_par)
+weights_par    <- ...
 fit_ipw_par    <- lm(Y ~ A, weights = weights_par)
 ate_ipw_par    <- coef(fit_ipw_par)["A"]
 ate_ipw_par_se <- sqrt(vcovHC(fit_ipw_par, type = "HC")["A", "A"])
@@ -260,6 +272,7 @@ cat("95% CI: [", round(ci_ipw_par[1], 4), ",", round(ci_ipw_par[2], 4), "]\n")
 
 # ── 5.2 Non-parametric propensity score model (Super Learner) ─────────────────
 
+# Container for cross-fitted propensity scores
 pi_hat <- numeric(N)
 
 for (k in 1:n_folds) {
@@ -268,8 +281,8 @@ for (k in 1:n_folds) {
   train <- setdiff(seq_len(N), test)
   
   sl_pi <- SuperLearner(
-    Y          = A[train],
-    X          = X[train, ],
+    Y          = ...,
+    X          = ...,
     SL.library = SL.library,
     family     = binomial(),
     method     = "method.NNLS",
@@ -309,11 +322,11 @@ data.frame(
        title = "Distribution of inverse weights by treatment group (cross-fitting)")
 
 # Horvitz-Thompson estimator
-ipw_weights <- A / pi_hat - (1 - A) / (1 - pi_hat)
+ipw_weights <- ...
 ate_ipw     <- mean(ipw_weights * Y)
 cat("IPW ATE - Horvitz-Thompson (cross-fitting):", round(ate_ipw, 4), "\n")
 
-# Weighted linear regression
+# Weighted linear regression (Hajek)
 weights_sl  <- A / pi_hat + (1 - A) / (1 - pi_hat)
 fit_ipw_sl  <- lm(Y ~ A, weights = weights_sl)
 
@@ -324,6 +337,9 @@ ci_ipw_sl     <- ate_ipw_sl + c(-1, 1) * 1.96 * ate_ipw_sl_se
 cat("IPW ATE - weighted regression (cross-fitting):", round(ate_ipw_sl, 4), "\n")
 cat("SE:", round(ate_ipw_sl_se, 4), "\n")
 cat("95% CI: [", round(ci_ipw_sl[1], 4), ",", round(ci_ipw_sl[2], 4), "]\n")
+
+# Why does the Hajek estimator differ from the Horvitz-Thompson estimator?
+# Which is generally preferred and why?
 
 
 ########################
@@ -336,25 +352,32 @@ cat("95% CI: [", round(ci_ipw_sl[1], 4), ",", round(ci_ipw_sl[2], 4), "]\n")
 # install_github("ehkennedy/npcausal")
 
 ate_npcausal <- ate(
-  y       = Y,
-  a       = A,
-  x       = X,
+  y       = ...,
+  a       = ...,
+  x       = ...,
   nsplits = 5,
   sl.lib  = SL.library
 )
 
+print(ate_npcausal$res)
+
+# Try changing nsplits (e.g. 1, 2, 5). How does it affect the results?
 
 # ── 6.2 Manual AIPW ──────────────────────────────────────────────────────────
 
-aug_1    <-  A      * (Y - Q1) / pi_hat
-aug_0    <- (1 - A) * (Y - Q0) / (1 - pi_hat)
+aug_1    <- ...
+aug_0    <- ...
 psi_i    <- (Q1 - Q0) + aug_1 - aug_0
-ate_aipw <- mean(psi_i)
-se_aipw  <- sd(psi_i) / sqrt(N)
+
+ate_aipw <- ...
+se_aipw  <- ...
 ci_aipw  <- ate_aipw + c(-1, 1) * 1.96 * se_aipw
 
 cat("AIPW ATE (cross-fitting):", round(ate_aipw, 4), "\n")
 cat("95% CI: [", round(ci_aipw[1], 4), ",", round(ci_aipw[2], 4), "]\n")
+
+# What does double robustness mean in practice?
+# How does AIPW compare to G-computation and IPW?
 
 
 ########################
@@ -389,8 +412,8 @@ tmle_fit_xfit <- tmle(
   Q.SL.library = SL.library,
   g.SL.library = SL.library,
   family       = "binomial",
-  Q            = cbind(Q0, Q1),
-  g1W          = pi_hat
+  Q            = ...,
+  g1W          = ...
 )
 
 ate_tmle_xfit <- tmle_fit_xfit$estimates$ATE$psi
@@ -402,16 +425,16 @@ cat("95% CI: [", round(ci_tmle_xfit[1], 4), ",", round(ci_tmle_xfit[2], 4), "]\n
 # ── 7.2 Manual TMLE ──────────────────────────────────────────────────────────
 
 # Clever covariates
-H1 <- A / pi_hat
-H0 <- (1 - A) / (1 - pi_hat)
+H1 <- ...
+H0 <- ...
 
 # Estimate fluctuation parameters (one per arm)
 delta1 <- coef(glm(Y ~ -1 + offset(qlogis(Q1)) + H1, family = binomial()))
 delta0 <- coef(glm(Y ~ -1 + offset(qlogis(Q0)) + H0, family = binomial()))
 
 # Update initial predictions
-Q1_updated <- plogis(qlogis(Q1) + delta1 / pi_hat)
-Q0_updated <- plogis(qlogis(Q0) + delta0 / (1 - pi_hat))
+Q1_updated <- ...
+Q0_updated <- ...
 
 # ATE estimate
 ate_tmle_manual <- mean(Q1_updated - Q0_updated)
@@ -427,6 +450,9 @@ ci_tmle_manual <- ate_tmle_manual + c(-1, 1) * 1.96 * se_tmle_manual
 cat("TMLE ATE (cross-fitting, manual):", round(ate_tmle_manual, 4), "\n")
 cat("SE:", round(se_tmle_manual, 4), "\n")
 cat("95% CI: [", round(ci_tmle_manual[1], 4), ",", round(ci_tmle_manual[2], 4), "]\n")
+
+# What is the role of the fluctuation step in TMLE?
+# How does TMLE differ from AIPW in how it achieves double robustness?
 
 
 ########################
@@ -455,16 +481,22 @@ results %>%
   labs(x = "Estimated ATE", y = NULL,
        title = "ATE estimates across estimators (cross-fitting, Super Learner)")
 
+# Do the estimators agree? Which would you trust most and why?
+# Does the confidence interval exclude zero?
+
 
 ########################
 # BONUS: AIPW AND TMLE FOR ATT
 ########################
 
+# The ATT = E[Y^1 - Y^0 | A = 1] targets the effect only among treated patients.
+# How does the interpretation differ from the ATE?
+
 # ── AIPW for ATT (npcausal) ───────────────────────────────────────────────────
 att_npcausal <- att(
-  y       = Y,
-  a       = A,
-  x       = X,
+  y       = ...,
+  a       = ...,
+  x       = ...,
   nsplits = 5,
   sl.lib  = SL.library
 )
@@ -477,7 +509,6 @@ att_manual <- mean(
     ((1 - A) * pi_hat / (1 - pi_hat)) * (Y - Q0) / mean(A)
 )
 
-# Influence function and standard error
 att_ic <- (A / mean(A)) * (Y - Q0 - att_manual) -
   ((1 - A) * pi_hat / (1 - pi_hat)) * (Y - Q0) / mean(A)
 
@@ -514,3 +545,6 @@ se_att_tmle_manual <- sd(att_ic_tmle) / sqrt(N)
 
 cat("TMLE ATT (cross-fitting, manual):", round(att_tmle_manual, 4), "\n")
 cat("SE:", round(se_att_tmle_manual, 4), "\n")
+
+# How does the ATT compare to the ATE? What does the difference tell you
+# about effect heterogeneity between treated and untreated patients?
