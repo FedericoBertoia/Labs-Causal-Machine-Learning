@@ -130,7 +130,7 @@ lindner %>%
        title = "Survival at 6 months by treatment group")
 ```
 
-### 1.2 Covariate distributions 
+### 1.2 Covariate distributions
 
 ```{r eda-covariates}
 
@@ -653,7 +653,7 @@ and a manual derivation that makes the fluctuation step explicit.
 ### 7.1 tmle Package
 
 ```{r tmle}
-# ── Without cross-fitting ─────────────────────────────────────────────────────
+# ── With cross-fitting estimating again the nuisances ─────────────────────────
 tmle_fit <- tmle(
   Y            = Y,
   A            = A,
@@ -661,8 +661,8 @@ tmle_fit <- tmle(
   Q.SL.library = SL.library,
   g.SL.library = SL.library,
   family       = "binomial",
-  V.Q          = 1,
-  V.g          = 1
+  V.Q          = 5,
+  V.g          = 5
 )
 
 ate_tmle <- tmle_fit$estimates$ATE$psi
@@ -793,11 +793,20 @@ print(att_npcausal$res)
 
 ```{r estimating equations ATT}
 
-att_cf_manual <- mean((A/mean(A))*(Y-Q0_cf)-((1-A)*pi_hat_cf/(1-pi_hat_cf))*(Y-Q0_cf)/mean(A))
+# ── AIPW estimator for ATT ────────────────────────────────────────────────────
+att_cf_manual <- mean(
+  (A / mean(A)) * (Y - Q0_cf) -
+  ((1 - A) * pi_hat_cf / (1 - pi_hat_cf)) * (Y - Q0_cf) / mean(A)
+)
 
-att_ic <- (A/mean(A))*(Y-Q0_cf-att_cf_manual)-((1-A)*pi_hat_cf/(1-pi_hat_cf))*(Y-Q0_cf)/mean(A)
+# ── Influence function and standard error ─────────────────────────────────────
+att_ic <- (A / mean(A)) * (Y - Q0_cf - att_cf_manual) -
+          ((1 - A) * pi_hat_cf / (1 - pi_hat_cf)) * (Y - Q0_cf) / mean(A)
 
-c(att_cf_manual,sd(att_ic)/sqrt(length(A)))
+se_att_cf_manual <- sd(att_ic) / sqrt(N)
+
+cat("AIPW ATT (cross-fitting, manual):", round(att_cf_manual, 4), "\n")
+cat("SE:", round(se_att_cf_manual, 4), "\n")
 ```
 
 ### 9.2 TMLE for ATT
@@ -813,13 +822,24 @@ cat("95% CI: [", round(ci_tmle_cf[1], 4), ",", round(ci_att_tmle_cf[2], 4), "]\n
 
 ```{r manual TMLE ATT}
 
-fluctmod_att <- lm(Y[A==0]~-1+offset(Q0_cf[A==0])+I(pi_hat_cf[A==0]/(1-pi_hat_cf[A==0])))
+# ── Fluctuation model for ATT ─────────────────────────────────────────────────
+fluctmod_att <- lm(
+  Y[A == 0] ~ -1 + offset(Q0_cf[A == 0]) + I(pi_hat_cf[A == 0] / (1 - pi_hat_cf[A == 0]))
+)
 
-Q0_cf_updated_att <- Q0_cf + fluctmod_att$coef*pi_hat_cf/(1-pi_hat_cf)
 
-att_tmle_cf_manual <- mean((A/mean(A))*(Y-Q0_cf_updated_att))
+# ── Update initial predictions ────────────────────────────────────────────────
+Q0_cf_updated_att <- Q0_cf + coef(fluctmod_att) * pi_hat_cf / (1 - pi_hat_cf)
 
-att_ic_tmle <- (A/mean(A))*(Y-Q0_cf_updated_att-att_tmle_cf_manual)-((1-A)*pi_hat_cf/(1-pi_hat_cf))*(Y-Q0_cf_updated_att)/mean(A) 
+# ── ATT estimate ──────────────────────────────────────────────────────────────
+att_tmle_cf_manual <- mean((A / mean(A)) * (Y - Q0_cf_updated_att))
 
-c(att_tmle_cf_manual,sd(att_ic_tmle)/sqrt(length(A)))
+# ── Influence function and standard error ─────────────────────────────────────
+att_ic_tmle <- (A / mean(A)) * (Y - Q0_cf_updated_att - att_tmle_cf_manual) -
+               ((1 - A) * pi_hat_cf / (1 - pi_hat_cf)) * (Y - Q0_cf_updated_att) / mean(A)
+
+se_att_tmle_cf_manual <- sd(att_ic_tmle) / sqrt(N)
+
+cat("TMLE ATT (cross-fitting, manual):", round(att_tmle_cf_manual, 4), "\n")
+cat("SE:", round(se_att_tmle_cf_manual, 4), "\n")
 ```
