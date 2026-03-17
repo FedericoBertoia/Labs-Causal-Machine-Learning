@@ -395,6 +395,7 @@ glm_pi     <- glm(formula_pi, family = binomial(), data = data.frame(A, X))
 pi_hat_par <- glm_pi$fitted.values
 
 # ── Positivity check ──────────────────────────────────────────────────────────
+# ── Positivity check ──────────────────────────────────────────────────────────
 summary(pi_hat_par)
 
 data.frame(pi_hat = pi_hat_par, A = factor(A, labels = c("No abciximab", "Abciximab"))) %>%
@@ -408,6 +409,19 @@ data.frame(pi_hat = pi_hat_par, A = factor(A, labels = c("No abciximab", "Abcixi
        fill  = "Treatment",
        color = "Treatment",
        title = "Propensity scores by treatment group (parametric)")
+
+data.frame(
+  weight = c(1 / pi_hat_par[A == 1], 1 / (1 - pi_hat_par[A == 0])),
+  A      = factor(c(rep(1, sum(A == 1)), rep(0, sum(A == 0))),
+                  labels = c("No abciximab", "Abciximab"))
+) %>%
+  ggplot(aes(x = A, y = weight, fill = A)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = 21) +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  theme_minimal() +
+  labs(x = NULL, y = "Inverse weight",
+       fill  = "Treatment",
+       title = "Distribution of inverse weights by treatment group (parametric)")
 
 # ── Weighted linear regression ────────────────────────────────────────────────
 weights_par <- A / pi_hat_par + (1 - A) / (1 - pi_hat_par)
@@ -456,6 +470,19 @@ data.frame(pi_hat = pi_hat, A = factor(A, labels = c("No abciximab", "Abciximab"
        fill  = "Treatment",
        color = "Treatment",
        title = "Propensity scores by treatment group (no cross-fitting)")
+
+data.frame(
+  weight = c(1 / pi_hat[A == 1], 1 / (1 - pi_hat[A == 0])),
+  A      = factor(c(rep(1, sum(A == 1)), rep(0, sum(A == 0))),
+                  labels = c("No abciximab", "Abciximab"))
+) %>%
+  ggplot(aes(x = A, y = weight, fill = A)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = 21) +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  theme_minimal() +
+  labs(x = NULL, y = "Inverse weight",
+       fill  = "Treatment",
+       title = "Distribution of inverse weights by treatment group (no cross-fitting)")
 
 # ── Horvitz-Thompson estimator ────────────────────────────────────────────────
 ipw_weights <- A / pi_hat - (1 - A) / (1 - pi_hat)
@@ -509,6 +536,19 @@ data.frame(pi_hat_cf = pi_hat_cf, A = factor(A, labels = c("No abciximab", "Abci
        color = "Treatment",
        title = "Propensity scores by treatment group (cross-fitting)")
 
+data.frame(
+  weight = c(1 / pi_hat_cf[A == 1], 1 / (1 - pi_hat_cf[A == 0])),
+  A      = factor(c(rep(1, sum(A == 1)), rep(0, sum(A == 0))),
+                  labels = c("No abciximab", "Abciximab"))
+) %>%
+  ggplot(aes(x = A, y = weight, fill = A)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = 21) +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  theme_minimal() +
+  labs(x = NULL, y = "Inverse weight",
+       fill  = "Treatment",
+       title = "Distribution of inverse weights by treatment group (cross-fitting)")
+
 # ── Horvitz-Thompson estimator ────────────────────────────────────────────────
 ipw_weights_cf <- A / pi_hat_cf - (1 - A) / (1 - pi_hat_cf)
 ate_ipw_cf     <- mean(ipw_weights_cf * Y)
@@ -543,19 +583,34 @@ $$
 \right]
 $$
 
-### 6.1 npcausal AIPW
+## 6.1 npcausal AIPW
 
-An easy way of doing it is to use the R package npcausal
-(<https://rdrr.io/github/ehkennedy/npcausal/>). To install and load this
-package in R from GitHub, run the following commands:
+An easy way to compute the AIPW estimator with cross-fitting is to use
+the [`npcausal`](https://rdrr.io/github/ehkennedy/npcausal/) package. To
+install it from GitHub:
 
-```         
-install.packages("devtools") library(devtools)  install_github("ehkennedy/npcausal") library(npcausal)
+```{r installation}
+#install.packages("devtools")
+#library(devtools)
+#install_github("ehkennedy/npcausal")
+library(npcausal)
 ```
 
-```{r npcausal aipw}
+The `ate()` function handles cross-fitting and inference internally,
+using the same number of folds and learner library as our manual
+implementation.
 
+```{r npcausal-aipw}
 
+ate_npcausal <- ate(
+  y       = Y,
+  a       = A,
+  x       = X,
+  nsplits = 5,
+  sl.lib  = SL.library
+)
+
+print(ate_npcausal$res)
 ```
 
 ### 6.2 manual AIPW
@@ -592,7 +647,7 @@ correcting the plug-in bias as AIPW does, TMLE updates the initial
 outcome model \$\\hat{Q}\$ through a targeted fluctuation step driven by
 the propensity score, ensuring the final estimate solves the efficient
 score equation exactly. We illustrate two implementations: the [\`tmle\`
-package]([https://cran.r-project.org/web/packages/tmle/refman/tmle.html)](https://cran.r-project.org/web/packages/tmle/refman/tmle.html))
+package](https://cran.r-project.org/web/packages/tmle/refman/tmle.html)
 and a manual derivation that makes the fluctuation step explicit.
 
 ### 7.1 tmle Package
@@ -605,7 +660,9 @@ tmle_fit <- tmle(
   W            = as.data.frame(X),
   Q.SL.library = SL.library,
   g.SL.library = SL.library,
-  family       = "binomial"
+  family       = "binomial",
+  V.Q          = 1,
+  V.g          = 1
 )
 
 ate_tmle <- tmle_fit$estimates$ATE$psi
@@ -723,18 +780,46 @@ $$
 
 ```{r npcausal ATT}
 
+att_npcausal <- att(
+  y       = Y,
+  a       = A,
+  x       = X,
+  nsplits = 5,
+  sl.lib  = SL.library
+)
+
+print(att_npcausal$res)
 ```
 
 ```{r estimating equations ATT}
 
+att_cf_manual <- mean((A/mean(A))*(Y-Q0_cf)-((1-A)*pi_hat_cf/(1-pi_hat_cf))*(Y-Q0_cf)/mean(A))
+
+att_ic <- (A/mean(A))*(Y-Q0_cf-att_cf_manual)-((1-A)*pi_hat_cf/(1-pi_hat_cf))*(Y-Q0_cf)/mean(A)
+
+c(att_cf_manual,sd(att_ic)/sqrt(length(A)))
 ```
 
 ### 9.2 TMLE for ATT
 
 ```{r tmle ATT}
 
+att_tmle_cf <- tmle_fit_cf$estimates$ATT$psi
+ci_att_tmle_cf  <- tmle_fit_cf$estimates$ATT$CI
+
+cat("TMLE ATT (cross-fitting):", round(att_tmle_cf, 4), "\n")
+cat("95% CI: [", round(ci_tmle_cf[1], 4), ",", round(ci_att_tmle_cf[2], 4), "]\n")
 ```
 
 ```{r manual TMLE ATT}
 
+fluctmod_att <- lm(Y[A==0]~-1+offset(Q0_cf[A==0])+I(pi_hat_cf[A==0]/(1-pi_hat_cf[A==0])))
+
+Q0_cf_updated_att <- Q0_cf + fluctmod_att$coef*pi_hat_cf/(1-pi_hat_cf)
+
+att_tmle_cf_manual <- mean((A/mean(A))*(Y-Q0_cf_updated_att))
+
+att_ic_tmle <- (A/mean(A))*(Y-Q0_cf_updated_att-att_tmle_cf_manual)-((1-A)*pi_hat_cf/(1-pi_hat_cf))*(Y-Q0_cf_updated_att)/mean(A) 
+
+c(att_tmle_cf_manual,sd(att_ic_tmle)/sqrt(length(A)))
 ```
