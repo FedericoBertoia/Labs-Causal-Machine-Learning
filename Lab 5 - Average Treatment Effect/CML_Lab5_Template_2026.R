@@ -13,7 +13,6 @@ library(SuperLearner)
 library(tmle)
 library(sandwich)
 library(stdReg)
-library(npcausal)
 
 # Reproducibility
 set.seed(123)
@@ -128,7 +127,7 @@ cat("Odds Ratio:", round(or, 4), "\n")
 cat("95% CI: [", round(ci_or[1], 4), ",", round(ci_or[2], 4), "]\n")
 
 # Why can't we interpret the OR causally here?
-
+# Do you see any other complications in interpreting the OR?
 
 ########################
 # 3. SETUP FOR CAUSAL ESTIMATORS
@@ -160,11 +159,12 @@ folds   <- split(seq_len(N), fold_id)
 formula_gcomp <- as.formula(paste("Y ~ A +", paste(colnames(X), collapse = " + ")))
 
 # Fit parametric outcome model
+# Hint: data = data.frame(Y, A, X)
 glm_Q <- ...
 
 # Predict potential outcomes
-dat0   <- data.frame(Y, A = 0, X)
-dat1   <- data.frame(Y, A = 1, X)
+dat0   <- ...
+dat1   <- ...
 Q0_par <- predict(glm_Q, newdata = dat0, type = "response")
 Q1_par <- predict(glm_Q, newdata = dat1, type = "response")
 
@@ -207,8 +207,8 @@ for (k in 1:n_folds) {
     cvControl  = list(V = 5)
   )
   
-  Q1[test] <- predict(sl_Q, newdata = data.frame(A = 1, X[test, ]))$pred
-  Q0[test] <- predict(sl_Q, newdata = data.frame(A = 0, X[test, ]))$pred
+  Q1[test] <- predict(sl_Q, newdata = ...)$pred
+  Q0[test] <- predict(sl_Q, newdata = ...)$pred
 }
 
 ate_gcomp <- mean(Q1 - Q0)
@@ -350,6 +350,7 @@ cat("95% CI: [", round(ci_ipw_sl[1], 4), ",", round(ci_ipw_sl[2], 4), "]\n")
 # install.packages("devtools")
 # library(devtools)
 # install_github("ehkennedy/npcausal")
+library(npcausal)
 
 ate_npcausal <- ate(
   y       = ...,
@@ -364,7 +365,7 @@ print(ate_npcausal$res)
 # Try changing nsplits (e.g. 1, 2, 5). How does it affect the results?
 
 # ── 6.2 Manual AIPW ──────────────────────────────────────────────────────────
-
+#Hint: take a look at the efficient influence function of the ATE
 aug_1    <- ...
 aug_0    <- ...
 psi_i    <- (Q1 - Q0) + aug_1 - aug_0
@@ -376,9 +377,7 @@ ci_aipw  <- ate_aipw + c(-1, 1) * 1.96 * se_aipw
 cat("AIPW ATE (cross-fitting):", round(ate_aipw, 4), "\n")
 cat("95% CI: [", round(ci_aipw[1], 4), ",", round(ci_aipw[2], 4), "]\n")
 
-# What does double robustness mean in practice?
-# How does AIPW compare to G-computation and IPW?
-
+# Which are the advantages of AIPW with relative G-computation and IPW? Do you see any drawback?
 
 ########################
 # 7. TMLE
@@ -405,6 +404,8 @@ cat("TMLE ATE:", round(ate_tmle, 4), "\n")
 cat("95% CI: [", round(ci_tmle[1], 4), ",", round(ci_tmle[2], 4), "]\n")
 
 # Supply cross-fitted nuisance estimates directly
+#Hint: we want to use our cross fitted predictions of Q and pi.
+#Hint: Q = cbind(x,x)
 tmle_fit_xfit <- tmle(
   Y            = Y,
   A            = A,
@@ -504,13 +505,9 @@ att_npcausal <- att(
 print(att_npcausal$res)
 
 # ── Manual AIPW for ATT ───────────────────────────────────────────────────────
-att_manual <- mean(
-  (A / mean(A)) * (Y - Q0) -
-    ((1 - A) * pi_hat / (1 - pi_hat)) * (Y - Q0) / mean(A)
-)
+att_manual <- ...
 
-att_ic <- (A / mean(A)) * (Y - Q0 - att_manual) -
-  ((1 - A) * pi_hat / (1 - pi_hat)) * (Y - Q0) / mean(A)
+att_ic <- ...
 
 se_att_manual <- sd(att_ic) / sqrt(N)
 
@@ -527,15 +524,13 @@ cat("95% CI: [", round(ci_att_tmle[1], 4), ",", round(ci_att_tmle[2], 4), "]\n")
 # ── Manual TMLE for ATT ───────────────────────────────────────────────────────
 
 # Fluctuation model for ATT (linear model on control arm only)
-fluctmod_att <- lm(
-  Y[A == 0] ~ -1 + offset(Q0[A == 0]) + I(pi_hat[A == 0] / (1 - pi_hat[A == 0]))
-)
+fluctmod_att <- ...
 
 # Update initial predictions
 Q0_updated_att <- Q0 + coef(fluctmod_att) * pi_hat / (1 - pi_hat)
 
 # ATT estimate
-att_tmle_manual <- mean((A / mean(A)) * (Y - Q0_updated_att))
+att_tmle_manual <- ...
 
 # Influence function and standard error
 att_ic_tmle <- (A / mean(A)) * (Y - Q0_updated_att - att_tmle_manual) -

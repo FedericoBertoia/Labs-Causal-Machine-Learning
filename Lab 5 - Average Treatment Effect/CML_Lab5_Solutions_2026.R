@@ -10,10 +10,11 @@ library(tidyr)
 library(ggplot2)
 library(patchwork)
 library(SuperLearner)
+library(ranger)
 library(tmle)
-library(sandwich)
 library(stdReg)
-library(npcausal)
+library(sandwich)
+
 
 # Reproducibility
 set.seed(123)
@@ -334,6 +335,7 @@ cat("95% CI: [", round(ci_ipw_sl[1], 4), ",", round(ci_ipw_sl[2], 4), "]\n")
 # install.packages("devtools")
 # library(devtools)
 # install_github("ehkennedy/npcausal")
+library(npcausal)
 
 ate_npcausal <- ate(
   y       = Y,
@@ -402,6 +404,7 @@ cat("95% CI: [", round(ci_tmle_xfit[1], 4), ",", round(ci_tmle_xfit[2], 4), "]\n
 # ── 7.2 Manual TMLE ──────────────────────────────────────────────────────────
 
 # Clever covariates
+#Hint: are the terms multipliying the residualized outcomes
 H1 <- A / pi_hat
 H0 <- (1 - A) / (1 - pi_hat)
 
