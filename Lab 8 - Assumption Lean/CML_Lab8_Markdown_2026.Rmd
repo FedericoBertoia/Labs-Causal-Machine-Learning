@@ -1,0 +1,883 @@
+---
+title: "Lab 8: Assumption-Lean Regression"
+subtitle: "Causal Machine Learning"
+author: "Stijn Vansteelandt and Federico Bertoia, Ghent University"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## 0. Introduction
+
+The goal of this lab is to apply **assumption-lean regression** to
+estimate the effect of a health program on a binary outcome, using the
+King County 2001 birth data. The key idea is to use a semiparametric
+model as an **approximation** rather than an assumption, and to estimate
+the resulting model-free estimand via its efficient influence function
+combined with machine learning.
+
+### Motivation
+
+Consider the partially linear model
+
+$$
+E(Y^a \mid L) = \alpha(L) + \beta(L) \cdot a.
+$$
+
+Instead of assuming $\beta(L) = \beta$ (constant), we summarize the
+distribution of $\beta(L)$ by its **overlap-weighted average**:
+
+$$
+\beta = \frac{E\{\text{Cov}(A, Y \mid L)\}}{E\{\text{Var}(A \mid L)\}} = \frac{E\{w(L)\,\beta(L)\}}{E\{w(L)\}},
+$$
+
+where for a binary exposure $A$, the overlap weights are
+$w(L) = P(A=1 \mid L)\,P(A=0 \mid L)$ and
+$\beta(L) = E(Y \mid A=1, L) - E(Y \mid A=0, L)$.
+
+The **efficient influence curve** of $\beta$ is:
+
+$$
+\mathrm{IF}(\beta) = \frac{\{A - E(A \mid L)\}\bigl[Y - E(Y \mid L) - \beta\{A - E(A \mid L)\}\bigr]}{E\bigl[\{A - E(A \mid L)\}^2\bigr]},
+$$
+
+which leads to the debiased estimator:
+
+$$
+\hat{\beta} = \frac{\sum_{i=1}^n \bigl\{A_i - \hat{E}(A_i \mid L_i)\bigr\}\bigl\{Y_i - \hat{E}(Y_i \mid L_i)\bigr\}}{\sum_{i=1}^n \bigl\{A_i - \hat{E}(A_i \mid L_i)\bigr\}^2}.
+$$
+
+In practice this corresponds to linearly regressing $(Y - \hat{q})$ onto
+$(A - \hat{p})$ with no intercept, using a sandwich (robust) standard
+error. Cross-fitting is recommended to avoid overfitting bias.
+
+------------------------------------------------------------------------
+
+### Data
+
+The **King County 2001** dataset contains birth certificate records from
+2,500 singleton births in King County, Washington (2001). The program of
+interest is **First Steps**, a 1989 Washington State initiative aimed at
+improving maternal and infant health for low-income pregnant women.
+
+| Variable | Role | Description |
+|----------------|----------------|-----------------------------------------|
+| `firstep` | Treatment | Participation in First Steps program (binary) |
+| `low_bwt` | Outcome | Low birth weight: `bwt < 2500` grams (binary) |
+| `age` | Exposure / Confounder | Maternal age in years |
+| `gender` | Confounder | Child's gender |
+| `race` | Confounder | Maternal race |
+| `parity` | Confounder | Number of previous live-born infants |
+| `married` | Confounder | Marital status |
+| `smoker` | Post-treatment | Smoking during pregnancy (excluded) |
+| `drinker` | Post-treatment | Alcohol use during pregnancy (excluded) |
+| `wpre` | Confounder | Pre-pregnancy weight (lbs) |
+| `education` | Confounder | Years of education |
+| `wgain`, `gestation` | Post-treatment | Weight gain, gestation weeks (excluded) |
+
+```{r setup-data}
+# ── Packages ──────────────────────────────────────────────────────────────────
+library(SuperLearner)  # install.packages("SuperLearner")
+library(lmtest)        # install.packages("lmtest")
+library(sandwich)      # install.packages("sandwich")
+library(dplyr)
+library(ggplot2)
+library(tibble)
+
+# ── Reproducibility ───────────────────────────────────────────────────────────
+set.seed(123)
+
+# ── Load data ─────────────────────────────────────────────────────────────────
+# Update the path below to point to your local copy of KingCounty2001.data
+file_path <- "KingCounty2001.data"
+
+df <- read.table(file_path)
+colnames(df) <- c("gender", "plural", "age", "race", "parity", "married",
+                  "bwt", "smokeN", "drinkN", "firstep", "welfare",
+                  "smoker", "drinker", "wpre", "wgain", "education", "gestation")
+
+# ── Initial inspection ────────────────────────────────────────────────────────
+glimpse(df)
+```
+
+------------------------------------------------------------------------
+
+## 1. Data Preparation
+
+We construct the binary outcome (low birth weight), recode categorical
+variables, and select the confounders, **excluding post-treatment
+variables** (`smoker`, `drinker`, `wgain`, `gestation`) to avoid
+mediation and collider bias.
+
+```{r data-prep}
+N <- nrow(df)
+
+# Binary outcome: low birth weight (< 2500 g)
+df$low_bwt <- as.integer(df$bwt < 2500)
+
+# Recode character variables to numeric
+df$gender  <- as.integer(df$gender  == "M")   # 1 = male
+df$smoker  <- as.integer(df$smoker  == "Y")   # 1 = smoker
+df$drinker <- as.integer(df$drinker == "Y")   # 1 = drinker
+df$married <- as.integer(df$married == "Y")   # 1 = married
+
+# Analysis datasets ────────────────────────────────────────────────────────────
+# Q1 & Q2: exposure = First Steps (binary), outcome = low_bwt
+Y <- df$low_bwt
+A <- df$firstep
+L <- df[, c("gender", "age", "race", "parity", "married",
+            "smoker", "drinker", "wpre", "education")]
+
+# Q3: exposure = maternal age (continuous), outcome = low_bwt
+# Exclude parity & firstep: potential mediators / not confounders of age→bwt
+y <- df$low_bwt
+a <- df$age
+l <- df[, c("gender", "married", "smoker", "drinker", "wpre", "education")]
+```
+
+------------------------------------------------------------------------
+
+## 2. Exploratory Data Analysis
+
+### 2.1 Outcome and exposure distributions
+
+```{r eda-outcome-exposure, fig.width=10, fig.height=4}
+p1 <- df %>%
+  mutate(firstep = factor(firstep, labels = c("Non-participant", "Participant"))) %>%
+  ggplot(aes(x = firstep, fill = firstep)) +
+  geom_bar(alpha = 0.8, width = 0.4) +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  theme_minimal() +
+  labs(x = NULL, y = "Count", title = "First Steps participation") +
+  theme(legend.position = "none")
+
+p2 <- df %>%
+  mutate(low_bwt = factor(low_bwt, labels = c("Normal weight", "Low birth weight"))) %>%
+  ggplot(aes(x = low_bwt, fill = low_bwt)) +
+  geom_bar(alpha = 0.8, width = 0.4) +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  theme_minimal() +
+  labs(x = NULL, y = "Count", title = "Low birth weight outcome") +
+  theme(legend.position = "none")
+
+library(patchwork)
+p1 + p2
+```
+
+### 2.2 Maternal age distribution
+
+```{r eda-age, fig.width=7, fig.height=4}
+ggplot(df, aes(x = age)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30,
+                 fill = "steelblue", alpha = 0.7) +
+  geom_density(color = "navy", linewidth = 0.8) +
+  theme_minimal() +
+  labs(x = "Maternal age (years)", y = "Density",
+       title = "Distribution of maternal age")
+```
+
+### 2.3 Outcome by First Steps participation
+
+```{r eda-lbw-by-firstep, fig.width=7, fig.height=4}
+df %>%
+  mutate(firstep = factor(firstep, labels = c("Non-participant", "Participant")),
+         low_bwt = factor(low_bwt, labels = c("Normal", "Low BW"))) %>%
+  count(firstep, low_bwt) %>%
+  group_by(firstep) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = firstep, y = prop, fill = low_bwt)) +
+  geom_col(position = "dodge", alpha = 0.85, width = 0.5) +
+  geom_text(aes(label = scales::percent(prop, accuracy = 0.1)),
+            position = position_dodge(width = 0.5), vjust = -0.4, size = 3.5) +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  theme_minimal() +
+  labs(x = NULL, y = "Proportion", fill = NULL,
+       title = "Low birth weight rate by First Steps participation")
+```
+
+------------------------------------------------------------------------
+
+## 3. Super Learner Setup
+
+We use `SuperLearner` to estimate the nuisance functions
+$\hat{E}(Y \mid L)$ (outcome model, $\hat{q}$) and $\hat{E}(A \mid L)$
+(exposure model / propensity score, $\hat{p}$).
+
+We start with a **small library** for speed, and extend it in Question
+4.
+
+```{r sl-setup}
+SL.library <- c("SL.glm", "SL.ranger")
+```
+
+> **Note on cross-fitting:** Without cross-fitting, nuisance functions
+> are fit on the same data used for the final estimator, which can
+> introduce overfitting bias. Cross-fitting (i.e. fitting on one fold
+> and predicting on another) removes this bias. We implement 2-fold
+> cross-fitting in Question 4.
+
+------------------------------------------------------------------------
+
+## 4. Question 1 — AL Linear Regression: First Steps → Low Birth Weight
+
+### 4.1 Relevant confounders
+
+Post-treatment variables (`smoker`, `drinker`, `wgain`, `gestation`) are
+**excluded** because adjusting for them would induce mediation or
+collider bias. Variables included as confounders are those measured
+*before* treatment that may jointly influence First Steps participation
+and birth weight: maternal age, race, parity, marital status,
+pre-pregnancy weight, and education.
+
+Possible **missing confounders** include household income (only proxied
+by education) and health insurance status, which affects both
+eligibility for First Steps and access to prenatal care.
+
+### 4.2 Estimating nuisance functions (no cross-fitting)
+
+```{r q1-nuisance}
+# Outcome model: E(Y | L)
+q.model <- SuperLearner(Y = Y, X = L,
+                        SL.library = SL.library,
+                        family = "binomial",
+                        cvControl = list(V = 5))
+q <- q.model$SL.predict
+
+# Exposure model: E(A | L) = P(A=1 | L)
+p.model <- SuperLearner(Y = A, X = L,
+                        SL.library = SL.library,
+                        family = "binomial",
+                        cvControl = list(V = 5))
+p <- p.model$SL.predict
+```
+
+### 4.3 Assumption-lean estimator via `lm` (sandwich SE)
+
+```{r q1-lm}
+# Regress (Y - q_hat) onto (A - p_hat), no intercept
+model_q1 <- lm(I(Y - q) ~ -1 + I(A - p))
+lm_res_q1 <- coeftest(model_q1, vcov = sandwich)
+
+beta_lm <- lm_res_q1[1, 1]
+se_lm   <- lm_res_q1[1, 2]
+```
+
+### 4.4 Assumption-lean estimator via EIF (by hand)
+
+```{r q1-eif}
+# Point estimate from the efficient influence function
+beta_eif <- mean((A - p) * (Y - q)) / mean((A - p)^2)
+
+# Standard error from the EIF
+se_eif <- (1 / sqrt(N)) *
+  sd((A - p) * (Y - q - beta_eif * (A - p)) / mean((A - p)^2))
+```
+
+### 4.5 Results
+
+```{r q1-results}
+results_q1 <- tibble(
+  Method    = c("Linear Model", "Eff. Influence Function"),
+  Estimate  = c(beta_lm,  beta_eif),
+  StdError  = c(se_lm,    se_eif),
+  CI_Lower  = c(beta_lm  - 1.96 * se_lm,  beta_eif  - 1.96 * se_eif),
+  CI_Upper  = c(beta_lm  + 1.96 * se_lm,  beta_eif  + 1.96 * se_eif)
+)
+
+knitr::kable(results_q1, digits = 4,
+             caption = "AL linear regression: First Steps on low birth weight")
+```
+
+> **Interpretation (assuming constant effect):** The estimate
+> $\hat\beta$ represents the overlap-weighted average risk difference
+> $E\{w(L)\beta(L)\}/E\{w(L)\}$. If $\beta(L) = \beta$ (constant), this
+> equals the population average treatment effect. Participation in First
+> Steps is estimated to **reduce** the probability of low birth weight
+> by approximately 0.39 percentage points; however, this estimate is
+> **not statistically significant** (95% CI includes 0).
+>
+> **If** $\beta(L)$ is not constant: The effect of First Steps likely
+> varies by individual characteristics (e.g. younger or less-educated
+> mothers may benefit more). The estimand is then a weighted average
+> that gives higher weight to covariate strata with greater treatment
+> variability—those where we learn most from the data.
+>
+> **Advantage over standard linear regression:** If the outcome model is
+> misspecified, the standard OLS coefficient no longer captures the
+> association of interest and may even be non-zero when
+> $A \perp\!\!\!\perp Y \mid L$. The assumption-lean estimator remains
+> interpretable regardless of misspecification, and valid data-adaptive
+> inference is obtained through the EIF.
+
+### 4.6 Comparison with AIPW and TMLE (optional)
+
+```{r q1-aipw-tmle, eval=FALSE}
+# AIPW (npcausal package)
+library(npcausal)
+ate.aipw <- ate(y = Y, a = A, x = L, nsplits = 5, sl.lib = SL.library)
+
+# TMLE
+library(tmle)
+ate.tmle <- tmle(Y = Y, A = A, W = L,
+                 Q.SL.library = SL.library,
+                 g.SL.library = SL.library,
+                 family = "binomial", V.Q = 5, V.g = 5)
+```
+
+> Note: `npcausal` assumes a Gaussian outcome by default. Results from
+> AIPW and TMLE target the average treatment effect (ATE) under a causal
+> interpretation, whereas the AL estimator targets the overlap-weighted
+> association.
+
+------------------------------------------------------------------------
+
+## 5. Question 2 — Weighted Baseline Characteristics
+
+Assumption-lean regression implicitly weights participants by
+$w(L) = P(A=1 \mid L)\,P(A=0 \mid L)$. It is therefore informative to
+report **weighted summary statistics** to characterize the effective
+study population.
+
+### 5.1 Why not plug in directly?
+
+The naive plug-in estimator
+$$\hat\theta_{\text{plug-in}} = \frac{\sum_i \hat{p}_i(1-\hat{p}_i)\,X_i}{\sum_i \hat{p}_i(1-\hat{p}_i)}$$
+suffers **plug-in bias**: machine learning estimates $\hat p_i$ are
+regularized (biased toward zero shrinkage) and the product
+$\hat{p}_i(1-\hat{p}_i)$ is a non-linear function of $p_i$, so the bias
+does not cancel in the ratio.
+
+### 5.2 EIF-based weighted summary
+
+The efficient influence function of
+$\theta = E\{P(A=1|L)P(A=0|L)\,X\}/E\{P(A=1|L)P(A=0|L)\}$ is:
+
+$$
+\mathrm{IF}(\theta) = -\frac{\bigl[P(A=1|L)P(A=0|L) + \{1 - 2P(A=1|L)\}\{A - P(A=1|L)\}\bigr](X - \theta)}{E\{P(A=1|L)P(A=0|L)\}}.
+$$
+
+It can be shown that $P(A=1|L)P(A=0|L) + \{1-2p\}(A-p) = (A-p)^2$, so
+the debiased estimator simplifies to:
+
+$$
+\hat\theta = \frac{\sum_i (A_i - \hat p_i)^2\,X_i}{\sum_i (A_i - \hat p_i)^2},
+\qquad
+\widehat{\mathrm{SE}}(\hat\theta) = \frac{1}{\sqrt{n}}\,\mathrm{sd}\!\left(\frac{(A_i-\hat p_i)^2(X_i-\hat\theta)}{E[p(1-p)]}\right).
+$$
+
+```{r q2-weighted-summary}
+# Recode non-numeric variables used in L
+L_num <- L
+# (already recoded: gender=0/1, smoker=0/1, drinker=0/1, married=0/1)
+# race is non-numeric → skipped automatically below
+
+weighted_summary <- do.call(rbind, lapply(names(L_num), function(varname) {
+  X <- L_num[[varname]]
+  if (!is.numeric(X)) return(NULL)
+
+  w_mean <- mean((A - p)^2 * X) / mean((A - p)^2)
+  eif    <- (A - p)^2 * (X - w_mean) / mean(p * (1 - p))
+  w_se   <- sd(eif) / sqrt(N)
+
+  data.frame(
+    variable    = varname,
+    w_mean      = round(w_mean, 3),
+    w_se        = round(w_se,   3),
+    w_CI_lower  = round(w_mean - 1.96 * w_se, 3),
+    w_CI_upper  = round(w_mean + 1.96 * w_se, 3)
+  )
+}))
+
+knitr::kable(weighted_summary,
+             col.names = c("Variable", "Weighted mean", "SE", "CI lower", "CI upper"),
+             caption   = "Weighted baseline characteristics (overlap weights)")
+```
+
+### 5.3 Classic (unweighted) summary for comparison
+
+```{r q2-classic-summary}
+classic_summary <- do.call(rbind, lapply(names(L_num), function(varname) {
+  X <- L_num[[varname]]
+  if (!is.numeric(X)) return(NULL)
+
+  c_mean <- mean(X)
+  c_se   <- sd(X) / sqrt(N)
+
+  data.frame(
+    variable    = varname,
+    c_mean      = round(c_mean, 3),
+    c_se        = round(c_se,   3),
+    c_CI_lower  = round(c_mean - 1.96 * c_se, 3),
+    c_CI_upper  = round(c_mean + 1.96 * c_se, 3)
+  )
+}))
+
+knitr::kable(classic_summary,
+             col.names = c("Variable", "Classic mean", "SE", "CI lower", "CI upper"),
+             caption   = "Classic (unweighted) baseline characteristics")
+```
+
+> **Interpretation:** Differences between weighted and unweighted means
+> reveal which subpopulation the AL estimator effectively targets.
+> Participants with intermediate propensity scores (neither near 0 nor
+> 1) receive the highest overlap weight, since they carry the most
+> information about the treatment effect.
+
+------------------------------------------------------------------------
+
+## 6. Question 3 — AL Linear Regression: Maternal Age → Low Birth Weight
+
+Here the **exposure is continuous** (maternal age). The estimand is:
+
+$$
+\beta = \frac{E\{\mathrm{Cov}(A, Y \mid L)\}}{E\{\mathrm{Var}(A \mid L)\}},
+$$
+
+interpreted as the average change in risk of low birth weight associated
+with a 1-year increase in maternal age, after adjusting for confounders
+$L$. This corresponds to a **shift intervention**: if everyone's age
+were shifted by $a$ years, the expected outcome would change by
+$\approx \beta \cdot a$.
+
+We exclude `parity` and `firstep` from the confounder set since they may
+mediate the age effect.
+
+```{r q3-nuisance}
+# Outcome model: E(Y | l)  [binary outcome]
+q2.model <- SuperLearner(Y = y, X = l,
+                         SL.library = SL.library,
+                         family = "binomial",
+                         cvControl = list(V = 5))
+q2 <- q2.model$SL.predict
+
+# Exposure model: E(A | l) for continuous A
+p2.model <- SuperLearner(Y = a, X = l,
+                         SL.library = SL.library,
+                         family = "gaussian",
+                         cvControl = list(V = 5))
+p2 <- p2.model$SL.predict
+```
+
+```{r q3-estimates}
+# LM with sandwich SE
+model_q3  <- lm(I(y - q2) ~ -1 + I(a - p2))
+lm_res_q3 <- coeftest(model_q3, vcov = sandwich)
+
+beta_lm3 <- lm_res_q3[1, 1]
+se_lm3   <- lm_res_q3[1, 2]
+
+# EIF
+beta_eif3 <- mean((a - p2) * (y - q2)) / mean((a - p2)^2)
+se_eif3   <- (1 / sqrt(N)) *
+  sd((a - p2) * (y - q2 - beta_eif3 * (a - p2)) / mean((a - p2)^2))
+
+results_q3 <- tibble(
+  Method   = c("Linear Model", "Eff. Influence Function"),
+  Estimate = c(beta_lm3, beta_eif3),
+  StdError = c(se_lm3,   se_eif3),
+  CI_Lower = c(beta_lm3 - 1.96 * se_lm3, beta_eif3 - 1.96 * se_eif3),
+  CI_Upper = c(beta_lm3 + 1.96 * se_lm3, beta_eif3 + 1.96 * se_eif3)
+)
+
+knitr::kable(results_q3, digits = 5,
+             caption = "AL linear regression: maternal age on low birth weight")
+```
+
+> **Interpretation (shift intervention):** A 1-year increase in maternal
+> age is estimated to change the risk of low birth weight by
+> $\hat\beta \approx 0.0017$ (roughly 0.17 percentage points). The 95%
+> confidence interval includes 0, so the association is **not
+> statistically significant**.
+
+------------------------------------------------------------------------
+
+## 7. Question 4 — Improved Estimates with Cross-Fitting and Richer Library
+
+Cross-fitting removes the overfitting bias that arises when the same
+observations are used to fit nuisance functions and to compute the
+estimator. Here we use **2-fold cross-fitting** and add `SL.earth` to
+the learner library.
+
+```{r q4-setup}
+SL.library2 <- c("SL.glm", "SL.randomForest", "SL.earth")
+
+# Random split into two halves
+I  <- sort(sample(1:N, N / 2))
+IC <- setdiff(1:N, I)
+```
+
+### 7.1 First Steps program (binary exposure)
+
+```{r q4-firstep, cache=TRUE}
+# Fit on IC, predict on I
+q_IC.mod <- SuperLearner(Y = Y[IC], X = L[IC, ], SL.library = SL.library2,
+                         family = "binomial", cvControl = list(V = 5))
+p_IC.mod <- SuperLearner(Y = A[IC], X = L[IC, ], SL.library = SL.library2,
+                         family = "binomial", cvControl = list(V = 5))
+
+# Fit on I, predict on IC
+q_I.mod  <- SuperLearner(Y = Y[I],  X = L[I, ],  SL.library = SL.library2,
+                         family = "binomial", cvControl = list(V = 5))
+p_I.mod  <- SuperLearner(Y = A[I],  X = L[I, ],  SL.library = SL.library2,
+                         family = "binomial", cvControl = list(V = 5))
+
+# Cross-fitted predictions
+q_cf <- numeric(N)
+p_cf <- numeric(N)
+q_cf[I]  <- predict(q_IC.mod, newdata = L[I, ],  onlySL = TRUE)$pred
+q_cf[IC] <- predict(q_I.mod,  newdata = L[IC, ], onlySL = TRUE)$pred
+p_cf[I]  <- predict(p_IC.mod, newdata = L[I, ],  onlySL = TRUE)$pred
+p_cf[IC] <- predict(p_I.mod,  newdata = L[IC, ], onlySL = TRUE)$pred
+
+# Estimates
+model_q4a  <- lm(I(Y - q_cf) ~ -1 + I(A - p_cf))
+lm_res_q4a <- coeftest(model_q4a, vcov = sandwich)
+
+beta_lm_cf <- lm_res_q4a[1, 1]
+se_lm_cf   <- lm_res_q4a[1, 2]
+
+beta_eif_cf <- mean((A - p_cf) * (Y - q_cf)) / mean((A - p_cf)^2)
+se_eif_cf   <- (1 / sqrt(N)) *
+  sd((A - p_cf) * (Y - q_cf - beta_eif_cf * (A - p_cf)) / mean((A - p_cf)^2))
+
+results_q4a <- tibble(
+  Method   = c("Linear Model", "Eff. Influence Function"),
+  Estimate = c(beta_lm_cf, beta_eif_cf),
+  StdError = c(se_lm_cf,   se_eif_cf),
+  CI_Lower = c(beta_lm_cf - 1.96 * se_lm_cf, beta_eif_cf - 1.96 * se_eif_cf),
+  CI_Upper = c(beta_lm_cf + 1.96 * se_lm_cf, beta_eif_cf + 1.96 * se_eif_cf)
+)
+
+knitr::kable(results_q4a, digits = 4,
+             caption = "Q4 – Cross-fitted AL: First Steps on low birth weight")
+```
+
+### 7.2 Maternal age (continuous exposure)
+
+```{r q4-age, cache=TRUE}
+q4_IC.mod <- SuperLearner(Y = y[IC], X = l[IC, ], SL.library = SL.library2,
+                          family = "binomial", cvControl = list(V = 5))
+p4_IC.mod <- SuperLearner(Y = a[IC], X = l[IC, ], SL.library = SL.library2,
+                          family = "gaussian", cvControl = list(V = 5))
+
+q4_I.mod  <- SuperLearner(Y = y[I],  X = l[I, ],  SL.library = SL.library2,
+                          family = "binomial", cvControl = list(V = 5))
+p4_I.mod  <- SuperLearner(Y = a[I],  X = l[I, ],  SL.library = SL.library2,
+                          family = "gaussian", cvControl = list(V = 5))
+
+q4_cf <- numeric(N)
+p4_cf <- numeric(N)
+q4_cf[I]  <- predict(q4_IC.mod, newdata = l[I, ],  onlySL = TRUE)$pred
+q4_cf[IC] <- predict(q4_I.mod,  newdata = l[IC, ], onlySL = TRUE)$pred
+p4_cf[I]  <- predict(p4_IC.mod, newdata = l[I, ],  onlySL = TRUE)$pred
+p4_cf[IC] <- predict(p4_I.mod,  newdata = l[IC, ], onlySL = TRUE)$pred
+
+model_q4b  <- lm(I(y - q4_cf) ~ -1 + I(a - p4_cf))
+lm_res_q4b <- coeftest(model_q4b, vcov = sandwich)
+
+beta_lm4b <- lm_res_q4b[1, 1]
+se_lm4b   <- lm_res_q4b[1, 2]
+
+beta_eif4b <- mean((a - p4_cf) * (y - q4_cf)) / mean((a - p4_cf)^2)
+se_eif4b   <- (1 / sqrt(N)) *
+  sd((a - p4_cf) * (y - q4_cf - beta_eif4b * (a - p4_cf)) / mean((a - p4_cf)^2))
+
+results_q4b <- tibble(
+  Method   = c("Linear Model", "Eff. Influence Function"),
+  Estimate = c(beta_lm4b, beta_eif4b),
+  StdError = c(se_lm4b,   se_eif4b),
+  CI_Lower = c(beta_lm4b - 1.96 * se_lm4b, beta_eif4b - 1.96 * se_eif4b),
+  CI_Upper = c(beta_lm4b + 1.96 * se_lm4b, beta_eif4b + 1.96 * se_eif4b)
+)
+
+knitr::kable(results_q4b, digits = 5,
+             caption = "Q4 – Cross-fitted AL: maternal age on low birth weight")
+```
+
+------------------------------------------------------------------------
+
+## 8. Question 5 — Risk Ratio Scale
+
+We use **assumption-lean log-linear regression**:
+
+$$
+\log E(Y^a \mid L) = \alpha(L) + \beta a,
+$$
+
+so that
+$\beta = \log\bigl(E[Y^1 \mid L] / E[Y^0 \mid L]\bigr) = \log(\mathrm{RR})$
+and $\mathrm{RR} = e^\beta$.
+
+The debiased estimator regresses the pseudo-outcome
+
+$$
+\widetilde{Y}^{\log} = \log(\hat{Y}) - \hat{q}^{\log} + \frac{Y - \hat{Y}}{\hat{Y}}
+$$
+
+onto $(A - \hat{p})$ with no intercept (sandwich SE), where
+$\hat{q}^{\log} = \hat{E}[\log(\hat{Y}) \mid L]$.
+
+### 8.1 First Steps program
+
+```{r q5-rr-firstep, cache=TRUE}
+# Step 1: fit E(Y | A, L) using both A and L
+AL <- cbind(A = A, L)
+Y_hat.mod <- SuperLearner(Y = Y, X = AL,
+                          SL.library = SL.library,
+                          family = "binomial",
+                          cvControl = list(V = 5))
+Y_hat <- Y_hat.mod$SL.predict
+
+# Step 2: fit E[log(Y_hat) | L]
+log_Y_hat <- log(Y_hat)
+q_log.mod <- SuperLearner(Y = log_Y_hat, X = L,
+                          SL.library = SL.library,
+                          family = "gaussian",
+                          cvControl = list(V = 5))
+q_log <- q_log.mod$SL.predict
+
+# Step 3: construct pseudo-outcome and regress
+pseudo_log <- log_Y_hat - q_log + (Y - Y_hat) / Y_hat
+log_mod    <- lm(I(pseudo_log) ~ -1 + I(A - p))
+log_res    <- coeftest(log_mod, vcov = sandwich)
+
+log_beta <- log_res[1, 1]
+log_se   <- log_res[1, 2]
+
+RR_results <- tibble(
+  Method   = "Risk Ratio",
+  Estimate = exp(log_beta),
+  StdError = log_se,
+  CI_Lower = exp(log_beta - 1.96 * log_se),
+  CI_Upper = exp(log_beta + 1.96 * log_se)
+)
+
+knitr::kable(RR_results, digits = 3,
+             caption = "Risk ratio – First Steps program on low birth weight")
+```
+
+### 8.2 Maternal age
+
+```{r q5-rr-age, cache=TRUE}
+al <- cbind(a = a, l)
+y_hat.mod <- SuperLearner(Y = y, X = al,
+                          SL.library = SL.library,
+                          family = "binomial",
+                          cvControl = list(V = 5))
+y_hat <- y_hat.mod$SL.predict
+
+log_y_hat  <- log(y_hat)
+q2_log.mod <- SuperLearner(Y = log_y_hat, X = l,
+                           SL.library = SL.library,
+                           family = "gaussian",
+                           cvControl = list(V = 5))
+q2_log <- q2_log.mod$SL.predict
+
+pseudo_log2 <- log_y_hat - q2_log + (y - y_hat) / y_hat
+log_mod2    <- lm(I(pseudo_log2) ~ -1 + I(a - p2))
+log_res2    <- coeftest(log_mod2, vcov = sandwich)
+
+log_beta2 <- log_res2[1, 1]
+log_se2   <- log_res2[1, 2]
+
+RR_results2 <- tibble(
+  Method   = "Risk Ratio Age",
+  Estimate = exp(log_beta2),
+  StdError = log_se2,
+  CI_Lower = exp(log_beta2 - 1.96 * log_se2),
+  CI_Upper = exp(log_beta2 + 1.96 * log_se2)
+)
+
+knitr::kable(RR_results2, digits = 4,
+             caption = "Risk ratio – maternal age on low birth weight")
+```
+
+> **Interpretation:** A risk ratio of 1 (or log-RR of 0) corresponds to
+> no effect. The First Steps risk ratio and the per-year age risk ratio
+> are both close to 1 and not statistically significant.
+
+------------------------------------------------------------------------
+
+## 9. Question 6 — Odds Ratio Scale
+
+We use **assumption-lean logistic regression**:
+
+$$
+\mathrm{logit}\,E(Y^a \mid L) = \alpha(L) + \beta a,
+$$
+
+so that $\beta = \log(\mathrm{OR})$ and $\mathrm{OR} = e^\beta$.
+
+The pseudo-outcome is now:
+
+$$
+\widetilde{Y}^{\mathrm{logit}} = \mathrm{logit}(\hat{Y}) - \hat{q}^{\mathrm{logit}} + \frac{Y - \hat{Y}}{\hat{Y}(1 - \hat{Y})},
+$$
+
+which is regressed onto $(A - \hat{p})$ with no intercept and a sandwich
+SE.
+
+### 9.1 First Steps program
+
+```{r q6-or-firstep, cache=TRUE}
+logit_Y_hat <- log(Y_hat / (1 - Y_hat))
+q_logit.mod <- SuperLearner(Y = logit_Y_hat, X = L,
+                            SL.library = SL.library,
+                            family = "gaussian",
+                            cvControl = list(V = 5))
+q_logit <- q_logit.mod$SL.predict
+
+pseudo_logit <- logit_Y_hat - q_logit + (Y - Y_hat) / (Y_hat * (1 - Y_hat))
+logit_mod    <- lm(I(pseudo_logit) ~ -1 + I(A - p))
+logit_res    <- coeftest(logit_mod, vcov = sandwich)
+
+logit_beta <- logit_res[1, 1]
+logit_se   <- logit_res[1, 2]
+
+OR_results <- tibble(
+  Method   = "Odds Ratio",
+  Estimate = exp(logit_beta),
+  StdError = logit_se,
+  CI_Lower = exp(logit_beta - 1.96 * logit_se),
+  CI_Upper = exp(logit_beta + 1.96 * logit_se)
+)
+
+knitr::kable(OR_results, digits = 3,
+             caption = "Odds ratio – First Steps program on low birth weight")
+```
+
+### 9.2 Maternal age
+
+```{r q6-or-age, cache=TRUE}
+logit_y_hat  <- log(y_hat / (1 - y_hat))
+q2_logit.mod <- SuperLearner(Y = logit_y_hat, X = l,
+                             SL.library = SL.library,
+                             family = "gaussian",
+                             cvControl = list(V = 5))
+q2_logit <- q2_logit.mod$SL.predict
+
+pseudo_logit2 <- logit_y_hat - q2_logit + (y - y_hat) / (y_hat * (1 - y_hat))
+logit_mod2    <- lm(I(pseudo_logit2) ~ -1 + I(a - p2))
+logit_res2    <- coeftest(logit_mod2, vcov = sandwich)
+
+logit_beta2 <- logit_res2[1, 1]
+logit_se2   <- logit_res2[1, 2]
+
+OR_results2 <- tibble(
+  Method   = "Odds Ratio Age",
+  Estimate = exp(logit_beta2),
+  StdError = logit_se2,
+  CI_Lower = exp(logit_beta2 - 1.96 * logit_se2),
+  CI_Upper = exp(logit_beta2 + 1.96 * logit_se2)
+)
+
+knitr::kable(OR_results2, digits = 3,
+             caption = "Odds ratio – maternal age on low birth weight")
+```
+
+### 9.3 Visualizing the odds-ratio transformation
+
+An advantage of odds ratios is that they are bounded away from 0 (more
+stable numerically) and arise naturally from logistic models. A
+disadvantage is non-collapsibility: the marginal OR differs from the
+conditional OR even without confounding.
+
+To aid interpretation, we plot $E[Y \mid A=1, L]$ as a function of
+$E[Y \mid A=0, L]$ implied by the estimated log-OR $\hat\beta$:
+
+```{r q6-plot, fig.width=6, fig.height=5}
+expit <- function(x) 1 / (1 + exp(-x))
+logit <- function(p) log(p / (1 - p))
+
+x_seq <- seq(0.001, 0.999, length.out = 1000)
+y_seq <- expit(logit(x_seq) + logit_beta)
+
+plot(x_seq, y_seq, type = "l", col = "steelblue", lwd = 2,
+     xlab = expression(E(Y ~ "|" ~ A==0 ~ "," ~ L)),
+     ylab = expression(E(Y ~ "|" ~ A==1 ~ "," ~ L)),
+     main = expression("Implied" ~ E(Y ~ "|" ~ A==1 ~ "," ~ L) ~
+                       "= expit(logit(" * hat(Y)[A==0] * ") + " * hat(beta) * ")"))
+abline(0, 1, col = "gray50", lty = 2)
+legend("topleft", legend = c("OR model", "Identity"),
+       col = c("steelblue", "gray50"), lty = c(1, 2), bty = "n")
+```
+
+> When $\hat\beta$ is small (near 0), the curve nearly coincides with
+> the identity line, confirming a near-null association. If $\hat\beta$
+> were large, the S-shaped curve would highlight how the implied risk
+> difference $E(Y|A=1,L) - E(Y|A=0,L)$ varies across the baseline risk
+> spectrum—a key reason odds ratios are harder to interpret than risk
+> differences.
+
+------------------------------------------------------------------------
+
+## 10. Summary of Results
+
+```{r summary-table, fig.width=9, fig.height=5}
+summary_all <- tibble(
+  Exposure = rep(c("First Steps", "Maternal Age"), each = 3),
+  Scale    = rep(c("Risk Difference", "Risk Ratio", "Odds Ratio"), times = 2),
+  Estimate = c(beta_eif,        exp(log_beta),   exp(logit_beta),
+               beta_eif3,       exp(log_beta2),  exp(logit_beta2)),
+  SE       = c(se_eif,          log_se,          logit_se,
+               se_eif3,         log_se2,         logit_se2),
+  Null     = rep(c(0, 1, 1), 2)
+)
+
+summary_all <- summary_all %>%
+  mutate(CI_Lower = if_else(Scale == "Risk Difference",
+                            Estimate - 1.96 * SE, exp(log(Estimate) - 1.96 * SE)),
+         CI_Upper = if_else(Scale == "Risk Difference",
+                            Estimate + 1.96 * SE, exp(log(Estimate) + 1.96 * SE)))
+
+knitr::kable(summary_all %>% select(-Null) %>% mutate(across(where(is.numeric), ~round(.x, 4))),
+             caption = "Summary of all assumption-lean regression results")
+```
+
+```{r forest-plot, fig.width=9, fig.height=5}
+summary_all %>%
+  mutate(Label = paste(Exposure, "-", Scale),
+         Label = factor(Label, levels = rev(unique(Label)))) %>%
+  ggplot(aes(x = Estimate, y = Label, color = Exposure)) +
+  geom_point(size = 3) +
+  geom_errorbarh(aes(xmin = CI_Lower, xmax = CI_Upper), height = 0.3, linewidth = 0.8) +
+  geom_vline(aes(xintercept = Null), linetype = "dashed", color = "gray50") +
+  facet_wrap(~ Scale, scales = "free_x", nrow = 1) +
+  scale_color_manual(values = c("steelblue", "tomato")) +
+  theme_minimal() +
+  labs(x = "Estimate (95% CI)", y = NULL, color = "Exposure",
+       title = "Assumption-Lean Regression — King County 2001",
+       subtitle = "Risk difference, risk ratio, and odds ratio scales") +
+  theme(legend.position = "bottom")
+```
+
+------------------------------------------------------------------------
+
+## 11. Key Takeaways
+
+The assumption-lean framework offers three main advantages over standard
+regression:
+
+1.  **Robustness to misspecification.** The estimand $\beta =
+    E\{\mathrm{Cov}(A,Y|L)\}/E\{\mathrm{Var}(A|L)\}$ is well-defined
+    regardless of whether the working model holds. Under
+    misspecification, standard OLS may not even capture the sign of the
+    association.
+
+2.  **Valid data-adaptive inference.** By relying on the efficient
+    influence function and cross-fitting, we obtain valid confidence
+    intervals even when nuisance functions are estimated with machine
+    learning or data-driven model selection.
+
+3.  **Scale flexibility.** The same framework extends seamlessly to log
+    and logit links, enabling risk ratio and odds ratio estimation
+    without additional parametric assumptions.
+
+

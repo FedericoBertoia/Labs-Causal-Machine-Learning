@@ -1,0 +1,782 @@
+---
+title: "Lab 6: Causal Mediation Analysis"
+subtitle: "Causal Machine Learning"
+author: "Stijn Vansteelandt and Federico Bertoia, Ghent University"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## 0. Introduction
+
+The goal of this lab is to estimate **Natural Direct and Indirect
+Effects (NDE/NIE)** using the JOBS II randomized experiment. Mediation
+analysis decomposes the total causal effect of a treatment $A$ on an
+outcome $Y$ into:
+
+-   A **Natural Direct Effect (NDE)**: the effect of $A$ on $Y$ that
+    does not operate through the mediator $M$,
+-   A **Natural Indirect Effect (NIE)**: the effect of $A$ on $Y$ that
+    is mediated through $M$.
+
+Formally, under the potential outcomes framework:
+
+$$
+\text{NDE} = E[Y^{1, M^0} - Y^{0, M^0}],
+$$
+
+$$
+\text{NIE} = E[Y^{1, M^1} - Y^{1, M^0}],
+$$
+
+where $Y^{a, m}$ denotes the potential outcome under treatment $A = a$
+and mediator value $M = m$, and $M^a$ is the potential mediator value
+under treatment $A = a$.
+
+The **total effect** decomposes additively:
+
+$$
+\text{ATE} = \text{NDE} + \text{NIE}.
+$$
+
+Identification of the NDE and NIE requires the standard causal
+assumptions (consistency, positivity, and conditional exchangeability),
+plus the **cross-world independence** assumption: $Y^{a,m} \perp M^{a'}
+\mid W$ for all $a, a', m$.
+
+We use the `medoutcon` package, which implements a nonparametric
+one-step estimator that is doubly robust and asymptotically efficient,
+combined with Super Learner via `sl3` for flexible nuisance estimation.
+
+------------------------------------------------------------------------
+
+### Data
+
+The **JOBS II** dataset comes from a randomized field experiment
+evaluating a job training intervention for unemployed workers. The
+treatment $A$ (`treat`) indicates whether participants were randomly
+assigned to the job search intervention. Two outcomes and two mediators
+are considered across the exercises below.
+
+| Variable | Role | Description |
+|----|----|----|
+| `treat` | Treatment | Assignment to job training (binary) |
+| `job_seek` | Mediator | Job search self-efficacy score (continuous) |
+| `work1` | Mediator / Outcome | Employment status at follow-up (binary) |
+| `depress2` | Outcome | Depressive symptoms at follow-up (continuous) |
+| `econ_hard`, `depress1`, `sex`, `age`, `occp`, `marital`, `nonwhite`, `educ`, `income` | Confounders $W$ | Baseline covariates |
+
+```{r setup-data}
+# ── Packages ──────────────────────────────────────────────────────────────────
+library(mediation)   # install.packages("mediation")
+library(sl3)         # remotes::install_github("tlverse/sl3")
+library(medoutcon)   # remotes::install_github("nhejazi/medoutcon")
+library(dplyr)
+
+# ── Reproducibility ───────────────────────────────────────────────────────────
+set.seed(123)
+
+# ── Load data ─────────────────────────────────────────────────────────────────
+data(jobs)
+jobs <- as.data.frame(jobs)
+
+# ── Initial inspection ────────────────────────────────────────────────────────
+glimpse(jobs)
+```
+
+> **Note:** Run `?jobs` in your console to view full variable
+> documentation for the JOBS II dataset.
+
+------------------------------------------------------------------------
+
+## 1. Exploratory Data Analysis
+
+Before estimating mediation effects, we briefly explore the key
+variables: treatment assignment, the mediator `job_seek`, and the two
+outcomes `work1` and `depress2`.
+
+### 1.1 Treatment and mediator distribution
+
+```{r eda-treatment-mediator}
+library(ggplot2)
+library(patchwork)
+
+p1 <- jobs %>%
+  mutate(treat = factor(treat, labels = c("Control", "Treated"))) %>%
+  ggplot(aes(x = treat, fill = treat)) +
+  geom_bar(alpha = 0.8, width = 0.4) +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  theme_minimal() +
+  labs(x = NULL, y = "Count", title = "Treatment assignment") +
+  theme(legend.position = "none")
+
+p2 <- ggplot(jobs, aes(x = job_seek)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30,
+                 fill = "steelblue", alpha = 0.7) +
+  geom_density(color = "navy", linewidth = 0.8) +
+  theme_minimal() +
+  labs(x = "Job search self-efficacy", y = "Density",
+       title = "Mediator: job_seek")
+
+p1 + p2
+```
+
+### 1.2 Mediator by treatment group
+
+Does the training intervention increase job search self-efficacy? We
+compare the distribution of `job_seek` across treatment arms.
+
+```{r eda-mediator-by-treatment}
+jobs %>%
+  mutate(treat = factor(treat, labels = c("Control", "Treated"))) %>%
+  ggplot(aes(x = job_seek, fill = treat, color = treat)) +
+  geom_density(alpha = 0.3, linewidth = 0.8) +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  scale_color_manual(values = c("steelblue", "tomato")) +
+  theme_minimal() +
+  labs(x = "Job search self-efficacy", y = "Density",
+       fill = "Treatment", color = "Treatment",
+       title = "Distribution of job_seek by treatment arm")
+```
+
+### 1.3 Outcome distributions
+
+```{r eda-outcomes}
+p3 <- jobs %>%
+  mutate(
+    work1 = factor(as.numeric(work1) - 1, labels = c("Unemployed", "Employed")),
+    treat = factor(treat, labels = c("Control", "Treated"))
+  ) %>%
+  count(treat, work1) %>%
+  group_by(treat) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = treat, y = prop, fill = work1)) +
+  geom_col(position = "dodge", alpha = 0.8, width = 0.5) +
+  geom_text(aes(label = scales::percent(prop, accuracy = 0.1)),
+            position = position_dodge(width = 0.5), vjust = -0.5, size = 3) +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  theme_minimal() +
+  labs(x = NULL, y = "Proportion", fill = "work1",
+       title = "Employment status by treatment")
+
+p4 <- jobs %>%
+  mutate(treat = factor(treat, labels = c("Control", "Treated"))) %>%
+  ggplot(aes(x = depress2, fill = treat, color = treat)) +
+  geom_density(alpha = 0.3, linewidth = 0.8) +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  scale_color_manual(values = c("steelblue", "tomato")) +
+  theme_minimal() +
+  labs(x = "Depressive symptoms (depress2)", y = "Density",
+       fill = "Treatment", color = "Treatment",
+       title = "Depression score by treatment arm")
+
+p3 + p4
+```
+
+------------------------------------------------------------------------
+
+## 2. Super Learner Setup
+
+We use `sl3` to build a Super Learner for nuisance function estimation.
+The `medoutcon` package requires three nuisance components:
+
+-   $g(A \mid W)$: the propensity score (treatment model),
+-   $h(A \mid M, W)$: a secondary propensity model conditioning on the
+    mediator,
+-   $b(Y \mid A, M, W)$: the outcome regression.
+
+We construct two stacks: one for **binary** outputs (used for $g$ and
+$h$) and one for **continuous** outputs (used for $b$ when $Y$ is
+continuous).
+
+### 2.1 Binary Super Learner
+
+```{r sl-binary}
+sl3_list_learners("binomial")
+
+lrn_glm_bin <- Lrnr_glm_fast$new(family = binomial())
+lrn_gam_bin <- Lrnr_gam$new(family = binomial())
+lrn_earth_bin <- Lrnr_earth$new(degree = 2)
+lrn_ranger_bin <- Lrnr_ranger$new(probability = TRUE)
+
+# Stack and combine into Super Learner
+stack_bin <- Stack$new(lrn_glm_bin, lrn_gam_bin, lrn_earth_bin, lrn_ranger_bin)
+sl_bin    <- Lrnr_sl$new(learners = stack_bin)
+```
+
+### 2.2 Continuous Super Learner
+
+```{r sl-continuous}
+sl3_list_learners("continuous")
+
+lrn_glm_cont <- Lrnr_glm_fast$new(family = gaussian())
+lrn_gam_cont <- Lrnr_gam$new(family = gaussian())
+lrn_earth_cont <- Lrnr_earth$new(degree = 2)
+lrn_ranger_cont <- Lrnr_ranger$new(probability = FALSE)
+
+# Stack and combine into Super Learner
+stack_cont <- Stack$new(lrn_glm_cont, lrn_gam_cont, lrn_earth_cont, lrn_ranger_cont)
+sl_cont    <- Lrnr_sl$new(learners = stack_cont)
+```
+
+------------------------------------------------------------------------
+
+## 3. Question 1 — DAG
+
+```{r initial-dag}
+library(DiagrammeR)
+
+# ── Question 1: Full DAG (X, M, Z, Y, C) ─────────────────────────────────────
+dag_q1 <- grViz("
+digraph Q1 {
+  graph [layout = neato, bgcolor = transparent]
+  
+  node [shape = plaintext, fontname = 'Helvetica', fontsize = 16]
+  
+  X [pos = '0,0!']
+  M [pos = '2,1.5!']
+  Z [pos = '4,1.5!']
+  Y [pos = '6,0!']
+  C [pos = '3,-1.5!']
+  
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 1.5, color = '#444444']
+  X -> M
+  X -> Z
+  X -> Y
+  M -> Z
+  M -> Y
+  Z -> Y
+  
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 1.2,
+        style = dashed, color = '#888888']
+  C -> M
+  C -> Z
+  C -> Y
+}
+")
+dag_q1
+
+```
+
+where
+
+-   $Y=$ depressive symptoms (outcome),
+-   $X=$ job training intervention (exposure),
+-   $M=$ job search self-efficacy (mediator),
+-   $Z=$ employment status (mediator/outcome) and
+-   $C=$ baseline covariates.
+
+### 3.1 Identification Assumptions for Causal Mediation Analysis
+
+Identification of the NDE and NIE via the mediation formula requires
+four untestable assumptions. Below we state each one precisely and
+interpret it in the JOBS II context.
+
+**Assumption 1 — No unmeasured exposure–outcome confounding:**
+$$Y^{1,m} \perp\!\!\!\perp X \mid C$$ The potential outcome $Y^{1,m}$
+must be independent of treatment assignment, conditional on the baseline
+covariates $C$. In other words, there should be no common causes of the
+job training intervention $X$ and depressive symptoms $Y$ that are not
+captured by $C$.
+
+**Assumption 2 — No unmeasured exposure–mediator confounding:**
+$$M^0 \perp\!\!\!\perp X \mid C$$ The potential mediator value under
+control, $M^0$, must be independent of treatment assignment given $C$.
+There should be no unmeasured common causes of the intervention $X$ and
+job search self-efficacy $M$.
+
+**Assumption 3 — No unmeasured mediator–outcome confounding:**
+$$Y^{1,m} \perp\!\!\!\perp M \mid X = 1, C$$ Even after conditioning on
+treatment and baseline covariates, there should be no unmeasured
+variables that simultaneously affect the mediator $M$ and the outcome
+$Y$. Crucially, this assumption is required **even in randomized
+experiments**, since the mediator is never randomized.
+
+**Assumption 4 — No exposure-induced mediator–outcome confounding
+(cross-world assumption):** $$Y^{1,m} \perp\!\!\!\perp M^0 \mid C$$ This
+is the so-called *cross-world* assumption: the potential outcome under
+treatment ($Y^{1,m}$) must be independent of the potential mediator
+under control ($M^0$), given baseline covariates $C$. It rules out the
+existence of any post-treatment variable $L$ that is (i) caused by $X$
+and (ii) a confounder of the $M$–$Y$ relationship.
+
+> **Remark:** Assumptions 1 and 2 hold by design in JOBS II, since
+> treatment $X$ is randomly assigned. Assumptions 3 and 4 are not
+> guaranteed and must be justified.
+
+------------------------------------------------------------------------
+
+## 4. Question 2 — NDE and NIE: Effect of Training on Employment
+
+We estimate the NDE and NIE of the job training intervention ($A$) on
+**employment status**, $Y =$ `work1`, (binary), mediated through **job
+search self-efficacy**, $M =$ `job_seek` (continuous).
+
+The mediation model is:
+
+```{r dag2}
+dag_q2 <- grViz("
+digraph Q2 {
+  graph [layout = neato, bgcolor = transparent]
+  
+  node [shape = plaintext, fontname = 'Helvetica', fontsize = 16]
+  
+  X [pos = '0,0!']
+  M [pos = '2,1.5!']
+  Z [pos = '4,0!']
+  C [pos = '2,-1.5!']
+  
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 1.5, color = '#444444']
+  X -> M
+  X -> Z
+  M -> Z
+  
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 1.2,
+        style = dashed, color = '#888888']
+  C -> M
+  C -> Z
+}
+")
+dag_q2
+```
+
+where
+
+-   $X=$ job training intervention (exposure),
+-   $M=$ job search self-efficacy (mediator),
+-   $Z=$ employment status (mediator/outcome) and
+-   $C=$ baseline covariates.
+
+```{r define-variables-q2}
+W <- jobs[, c("econ_hard", "depress1", "sex", "age", "occp",
+              "marital", "nonwhite", "educ", "income")]
+A <- jobs$treat
+Z <- NULL
+Y <- as.numeric(jobs$work1) - 1   
+M <- jobs$job_seek     
+
+folds <- 5
+```
+
+### 4.1 Natural Direct Effect
+
+```{r nde-q2}
+nde1 <- medoutcon(
+  W = W, A = A, Z = NULL, M = M, Y = Y,
+  g_learners = sl_bin,
+  h_learners = sl_bin,
+  b_learners = sl_bin,
+  effect     = "direct",
+  estimator  = "onestep",
+  estimator_args = list(cv_folds = folds)
+)
+
+nde1
+```
+
+### 4.2 Natural Indirect Effect
+
+```{r nie-q2}
+nie1 <- medoutcon(
+  W = W, A = A, Z = NULL, M = M, Y = Y,
+  g_learners = sl_bin,
+  h_learners = sl_bin,
+  b_learners = sl_bin,
+  effect     = "indirect",
+  estimator  = "onestep",
+  estimator_args = list(cv_folds = folds)
+)
+
+nie1
+```
+
+> **Interpretation:** The NDE captures how much of the treatment effect
+> on employment operates through pathways other than job search
+> self-efficacy. The NIE quantifies what fraction flows through the
+> mediator $M$.
+
+### 4.3 Plausibility of the Identification Assumptions
+
+We now evaluate each of the four assumptions in the context of Question
+2, where $X =$ `treat`, $M =$ `job_seek`, $Y =$ `work1`, and $C$
+includes the nine baseline covariates.
+
+**Assumption 1 (No exposure–outcome confounding):** This assumption
+holds by design. Because workers were randomly assigned to treatment or
+control, the intervention $X$ is independent of all pre-treatment
+variables, including any unmeasured ones. There is no need to rely on
+$C$ to block confounding of the $X$–$Y$ relationship, though adjusting
+for $C$ can improve precision.
+
+**Assumption 2 (No exposure–mediator confounding):** This assumption
+also holds by design for the same reason. Random assignment ensures that
+$X$ is independent of all baseline characteristics, ruling out common
+causes of treatment and job search self-efficacy. No unmeasured
+confounding of the $X$–$M$ path is possible by construction.
+
+**Assumption 3 (No mediator–outcome confounding):** This assumption is
+*not* guaranteed by randomization. It requires that, among treated
+participants and conditional on $C$, there are no unmeasured variables
+jointly influencing job search self-efficacy and subsequent employment.
+A plausible violation would be **self-confidence or general
+motivation**: a highly motivated individual may naturally report higher
+self-efficacy *and* be more likely to find work regardless of the
+training content. Unless motivation is captured in $C$, Assumption 3
+fails.
+
+**Assumption 4 (Cross-world / no exposure-induced M–Y confounding):**
+This assumption requires that no post-treatment variable $L$, caused by
+the training workshop $X$, simultaneously confounds the $M$–$Y$
+relationship. A concrete threat is **social support networks** formed
+during the workshops: participation could build peer connections that
+both boost self-efficacy ($M$) and improve job search success ($Y$)
+through a channel unrelated to the training content itself. Since such
+networks are created *by* the intervention and confound $M$ and $Y$,
+Assumption 4 is violated.
+
+------------------------------------------------------------------------
+
+## 5. Question 3 — NDE and NIE: Effect of Training on Depression with Two Mediators
+
+We now turn to a **continuous outcome**, $Y =$ `depress2` (depressive
+symptoms), and consider **two mediators jointly**: job search
+self-efficacy , $M_1 =$ `job_seek`, and employment status, $M_2 =$
+`work1`.
+
+When $M = (M_1, M_2)$, the NIE captures the total indirect effect
+through both mediators simultaneously.
+
+```{r dag_q3}
+dag_q3 <- grViz("
+digraph NIE_Q3 {
+  graph [layout = neato, bgcolor = transparent]
+  node [shape = plaintext, fontname = 'Helvetica', fontsize = 16]
+
+  X [pos = '0,0!']
+  M [pos = '2,1.5!']
+  Z [pos = '4,1.5!']
+  Y [pos = '6,0!']
+  C [pos = '3,-1.5!']
+
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 2.0, color = 'red']
+  X -> M
+  X -> Z
+  M -> Y
+  Z -> Y
+  
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 1.5, color = '#444444']
+  X -> Y
+  
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 2.0, style = dashed, color = 'blue']
+  M -> Z
+
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 1.2,
+        style = dashed, color = '#888888']
+  C -> M
+  C -> Z
+  C -> Y
+}
+")
+dag_q3
+```
+
+```{r define-variables-q3}
+Y  <- jobs$depress2
+M1 <- jobs$job_seek
+M2 <- as.numeric(jobs$work1) - 1
+```
+
+### 5.1 Natural Direct Effect (two mediators)
+
+```{r nde-q3}
+nde2 <- medoutcon(
+  W = W, A = A, Z = NULL,
+  M = cbind(M1, M2),
+  Y = Y,
+  g_learners = sl_bin,
+  h_learners = sl_bin,
+  b_learners = sl_cont,
+  effect     = "direct",
+  estimator  = "onestep",
+  estimator_args = list(cv_folds = folds)
+)
+
+nde2
+```
+
+### 5.2 Natural Indirect Effect (two mediators)
+
+```{r nie-q3}
+nie2 <- medoutcon(
+  W = W, A = A, Z = NULL,
+  M = cbind(M1, M2),
+  Y = Y,
+  g_learners = sl_bin,
+  h_learners = sl_bin,
+  b_learners = sl_cont,
+  effect     = "indirect",
+  estimator  = "onestep",
+  estimator_args = list(cv_folds = folds)
+)
+
+nie2
+```
+
+> **Interpretation:** With both mediators included, the NIE measures the
+> combined indirect effect of the intervention on depression transmitted
+> through changes in job search self-efficacy *and* employment status.
+> The NDE captures what remains after blocking both pathways.
+
+------------------------------------------------------------------------
+
+## 6. Questions 4 & 5 — Path-Specific Effect via Mediator Difference
+
+We now isolate the **path-specific indirect effect** that flows
+exclusively through employment status $M_2$, not through job search
+self-efficacy $M_1$. This path-specific NIE can be recovered as:
+
+$$
+\text{NIE}_{M_2} = \text{NIE}_{(M_1, M_2)} - \text{NIE}_{M_1},
+$$
+
+where $\text{NIE}_{M_1}$ is the NIE with only $M_1$ as mediator, and
+$\text{NIE}_{(M_1, M_2)}$ was estimated in the previous section.
+
+**NIE from Question 3** — indirect effect through **both** $M$ and $Z$
+jointly.
+
+```{r dag-nie-q3}
+library(DiagrammeR)
+
+dag_q3 <- grViz("
+digraph NIE_Q3 {
+  graph [layout = neato, bgcolor = transparent]
+  node [shape = plaintext, fontname = 'Helvetica', fontsize = 16]
+
+  X [pos = '0,0!']
+  M [pos = '2,1.5!']
+  Z [pos = '4,1.5!']
+  Y [pos = '6,0!']
+  C [pos = '3,-1.5!']
+
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 2.0, color = 'red']
+  X -> M
+  X -> Z
+  M -> Y
+  Z -> Y
+  
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 1.5, color = '#444444']
+  X -> Y
+  
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 2.0, style = dashed, color = 'blue']
+  M -> Z
+
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 1.2,
+        style = dashed, color = '#888888']
+  C -> M
+  C -> Z
+  C -> Y
+}
+")
+dag_q3
+```
+
+where
+
+-   $Y=$ depressive symptoms (outcome),
+-   $X=$ job training intervention (exposure),
+-   $M=$ job search self-efficacy (mediator),
+-   $Z=$ employment status (mediator/outcome) and
+-   $C=$ baseline covariates.
+
+**NIE from Question 4(a)** — indirect effect through $M$ only.
+
+```{r dag-nie-q4a}
+dag_q4 <- grViz("
+digraph NIE_Q4a {
+  graph [layout = neato, bgcolor = transparent]
+  node [shape = plaintext, fontname = 'Helvetica', fontsize = 16]
+
+  X [pos = '0,0!']
+  M [pos = '2,1.5!']
+  Z [pos = '4,1.5!']
+  Y [pos = '6,0!']
+  C [pos = '3,-1.5!']
+
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 2.0, color = 'red']
+  X -> M
+  M -> Y
+
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 1.5, color = '#444444']
+  X -> Z
+  X -> Y
+  Z -> Y
+  
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 2.0, style = dashed, color = 'blue']
+  M -> Z
+
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 1.2,
+        style = dashed, color = '#888888']
+  C -> M
+  C -> Z
+  C -> Y
+}
+")
+dag_q4
+```
+
+where
+
+-   $Y=$ depressive symptoms (outcome),
+-   $X=$ job training intervention (exposure),
+-   $M=$ job search self-efficacy (mediator),
+-   $Z=$ employment status (mediator/outcome) and
+-   $C=$ baseline covariates.
+
+### 6.1 NIE through $M_1$ only (job search self-efficacy)
+
+```{r nie-m1-only}
+nie_MY <- medoutcon(
+  W = W, A = A, Z = NULL,
+  M = M1,
+  Y = Y,
+  g_learners = sl_bin,
+  h_learners = sl_bin,
+  b_learners = sl_cont,
+  effect     = "indirect",
+  estimator  = "onestep",
+  estimator_args = list(cv_folds = folds)
+)
+
+nie_MY
+```
+
+### 6.2 Path-specific NIE through $M_2$ (employment status)
+
+**The difference** $\text{NIE}_{(M,Z)} - \text{NIE}_{M}$ therefore
+isolates the path $X \to Z \to Y$ — the part of the indirect effect that
+flows through employment status **directly**, bypassing job search
+self-efficacy:
+
+```{r dag-nie-diff}
+dag_q5 <- grViz("
+digraph NIE_diff {
+  graph [layout = neato, bgcolor = transparent]
+  node [shape = plaintext, fontname = 'Helvetica', fontsize = 16]
+
+  X [pos = '0,0!']
+  M [pos = '2,1.5!']
+  Z [pos = '4,1.5!']
+  Y [pos = '6,0!']
+  C [pos = '3,-1.5!']
+
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 2.0, color = 'red']
+  X -> Z
+  Z -> Y
+
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 1.5, color = '#444444']
+  X -> M
+  X -> Y
+  M -> Y
+  
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 2.0, style = dashed, color = 'blue']
+  M -> Z
+
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 1.2,
+        style = dashed, color = '#888888']
+  C -> M
+  C -> Z
+  C -> Y
+}
+")
+dag_q5
+```
+
+where
+
+-   $Y=$ depressive symptoms (outcome),
+-   $X=$ job training intervention (exposure),
+-   $M=$ job search self-efficacy (mediator),
+-   $Z=$ employment status (mediator/outcome) and
+-   $C=$ baseline covariates.
+
+```{r path-specific-nie}
+N <- length(A)
+
+# Point estimate
+nie_diff    <- round(nie2$theta - nie_MY$theta, 3)
+
+# SE based on the difference of EIFs
+nie_diff_se <- round((1 / sqrt(N)) * sd(nie2$eif - nie_MY$eif), 3)
+
+# 95% Confidence interval
+nie_diff_lb <- round(nie_diff - 1.96 * nie_diff_se, 3)
+nie_diff_ub <- round(nie_diff + 1.96 * nie_diff_se, 3)
+
+cat("Path-specific NIE (M2 only):", nie_diff, "\n")
+cat("SE:", nie_diff_se, "\n")
+cat("95% CI: [", nie_diff_lb, ",", nie_diff_ub, "]\n")
+```
+
+> **Interpretation:** The path-specific NIE through $M_2$ isolates the
+> part of the treatment effect on depression that operates via changes
+> in employment status, after accounting for the channel through job
+> search self-efficacy. The equivalence of the differencing approach and
+> the direct estimation confirms the additive decomposition property of
+> natural indirect effects.
+
+------------------------------------------------------------------------
+
+## 7. Summary of Results
+
+We collect all estimates into a summary table and visualize them in a
+forest plot for ease of comparison.
+
+```{r summary-table}
+library(tibble)
+
+results <- tibble(
+  Effect = c(
+    "NDE (A → work1, blocking job_seek)",
+    "NIE (A → work1, via job_seek)",
+    "NDE (A → depress2, blocking M1+M2)",
+    "NIE (A → depress2, via M1+M2)",
+    "NIE (A → depress2, via M1 only)",
+    "Path-specific NIE (A → depress2, via M2 only)"
+  ),
+  Estimate = round(c(
+    nde1$theta, nie1$theta, nde2$theta,
+    nie2$theta, nie_MY$theta, nie_diff
+  ), 3),
+  SE = round(c(
+    sqrt(nde1$var), sqrt(nie1$var), sqrt(nde2$var),
+    sqrt(nie2$var), sqrt(nie_MY$var), nie_diff_se
+  ), 3)
+)
+print(results)
+```
+
+```{r forest-plot}
+results %>%
+  mutate(
+    CI_lower = Estimate - 1.96 * SE,
+    CI_upper = Estimate + 1.96 * SE,
+    Effect   = factor(Effect, levels = rev(Effect))
+  ) %>%
+  ggplot(aes(x = Estimate, y = Effect)) +
+  geom_point(size = 3, color = "tomato") +
+  geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper),
+                 height = 0.25, linewidth = 0.8, color = "tomato") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  theme_minimal() +
+  labs(x = "Estimate (one-step, Super Learner)",
+       y = NULL,
+       title = "Natural Direct and Indirect Effects — JOBS II")
+```
