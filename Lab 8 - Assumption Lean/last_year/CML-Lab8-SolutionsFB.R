@@ -580,3 +580,83 @@ abline(0, 1, col = "gray", lty = 2)  # identity line
 
 
 
+
+
+
+#########################
+# 4. alglm_psi
+#########################
+library(lmtest) 
+library(sandwich) 
+library(SuperLearner)
+library(engression)
+
+source("C:/Users/fbertoia/OneDrive - UGent/Desktop/GitHub/DML-Risk-Minimization/functions/99_functions_sl_poisson.R")
+source("C:/Users/fbertoia/OneDrive - UGent/Desktop/GitHub/DML-Risk-Minimization/functions/alglm.R")
+source("C:/Users/fbertoia/OneDrive - UGent/Desktop/GitHub/DML-Risk-Minimization/functions/functions_alglm.R")
+source("C:/Users/fbertoia/OneDrive - UGent/Desktop/GitHub/DML-Risk-Minimization/functions/functions_data_analysis.R")
+source("C:/Users/fbertoia/OneDrive - UGent/Desktop/GitHub/DML-Risk-Minimization/functions/functions_alglm_psi.R")
+
+# --- alglm Parameters ---
+link      <- "identity"
+loss      <- "both"
+family.y  <- "binomial"
+family.a  <- "gaussian"
+n_folds   <- 2
+stratify  <- FALSE
+J         <- 100
+SL.library <- c("SL.glm", "SL.glm.interaction", "SL.ranger", "SL.gam", "SL.earth")
+verbose   <- TRUE
+parallel  <- TRUE
+quad      <- TRUE
+
+psi_form <- make_psi_linear()
+
+# --- Engression Parameters ---
+num_epochs <- 1000
+noise_dim  <- 5
+hidden_dim <- 100
+num_layer  <- 3
+
+
+
+
+start_time <- proc.time()
+
+alglm_psi.fit <- alglm_psi(
+  Y          = y,
+  A          = a,
+  L          = l,
+  psi_spec   = psi_form,
+  link       = link,
+  family.y   = family.y,
+  family.a   = family.a,
+  n_folds    = n_folds,
+  SL.library = SL.library,
+  J          = J,
+  loss       = loss,
+  num_epochs = num_epochs,
+  noise_dim  = noise_dim,
+  hidden_dim = hidden_dim,
+  num_layer  = num_layer,
+  parallel   = parallel,
+  verbose    = verbose,
+  n_quad     = 15L          
+)
+
+end_time <- proc.time()
+runtime <- (end_time - start_time)/60
+runtime["elapsed"]
+
+
+plot_average_shift_effect_psi(
+  fit        = alglm_psi.fit,
+  A_std      = a,
+  Y          = y,
+  a_grid     = seq(-20, 20, by = 0.05),  
+  link       = link,
+  estimators = c("response"),
+  conf_band  = TRUE,
+  A_sd       = 1
+)
+

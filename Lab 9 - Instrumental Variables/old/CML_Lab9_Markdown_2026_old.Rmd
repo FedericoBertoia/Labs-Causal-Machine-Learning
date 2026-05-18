@@ -1,0 +1,500 @@
+---
+title: "Lab 9: Instrumental Variable Analysis"
+subtitle: "Causal Machine Learning"
+author: "Stijn Vansteelandt and Federico Bertoia, Ghent University"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## 0. Introduction
+
+The goal of this lab is to perform **Instrumental Variable (IV)
+analysis** using data from a study of 139 premenopausal women. We are
+interested in estimating the causal effect of serum IGFBP-3 levels on
+total dense breast tissue area, while accounting for unmeasured
+confounding.
+
+Standard regression methods require that all common causes of the
+exposure and outcome are measured and adjusted for — an assumption that
+is often untestable and likely violated in observational data. When
+unmeasured confounders $U$ are present, IV methods can still identify
+causal effects, provided a valid instrument $R$ is available.
+
+An **instrumental variable** $R$ must satisfy three assumptions:
+
+1.  **Relevance**: $R$ is associated with the exposure $A$,
+2.  **Exclusion restriction**: $R$ affects the outcome $Y$ only through
+    $A$,
+3.  **Randomization**: $R$ is (conditionally) independent of $$Y^a$$.
+
+The **estimand** under a linear structural mean model
+$E(Y \mid A, L, R, U) = \psi A + g(L, U)$ is:
+
+$$
+\psi = \frac{E\{\text{Cov}(R, Y \mid L)\}}{E\{\text{Cov}(R, A \mid L)\}}
+$$
+
+This can be estimated via the **Efficient Influence Function (EIF)**
+estimator:
+
+$$
+\hat{\psi} =
+\frac{\sum_{i=1}^n \bigl\{R_i - \hat{E}(R_i \mid L_i)\bigr\}
+\bigl\{Y_i - \hat{E}(Y_i \mid L_i)\bigr\}}
+{\sum_{i=1}^n \bigl\{R_i - \hat{E}(R_i \mid L_i)\bigr\}
+\bigl\{A_i - \hat{E}(A_i \mid L_i)\bigr\}}
+$$
+
+with standard error estimated as $n^{-1/2}$ times the sample standard
+deviation of the influence function values divided by the denominator.
+Cross-fitting with data-adaptive nuisance estimators (Super Learner) is
+recommended.
+
+------------------------------------------------------------------------
+
+### Data
+
+The dataset `igf.dta` contains observations on 139 premenopausal women.
+
+| Variable  | Role           | Description                               |
+|-----------|----------------|-------------------------------------------|
+| `lucent`  | Outcome $Y$    | Total area of dense tissue in the breast  |
+| `igfbp3`  | Exposure $A$   | Serum IGFBP-3 levels                      |
+| `igfbp3g` | Instrument $R$ | Putative functional genotype (AA, AC, CC) |
+| `age`     | Confounder $L$ | Patient's age                             |
+| `afbcat`  | Confounder $L$ | Age at first birth (categorized)          |
+| `brfcat`  | Confounder $L$ | Breast feeding duration                   |
+| `parcat`  | Confounder $L$ | Number of children                        |
+| `ev_pil`  | Confounder $L$ | Ever taken oral contraceptives (binary)   |
+| `bmi`     | —              | Body mass index                           |
+| `ev_smok` | —              | Ever smoked (binary)                      |
+
+Both the exposure and outcome will be log-transformed throughout to
+facilitate interpretation and improve distributional symmetry.
+
+```{r setup-data}
+# ── Packages ──────────────────────────────────────────────────────────────────
+library(foreign)      # read.dta
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(tibble)
+library(SuperLearner)
+library(lmtest)
+library(sandwich)
+
+# ── Reproducibility ───────────────────────────────────────────────────────────
+set.seed(123)
+
+# ── Load data ─────────────────────────────────────────────────────────────────
+data <- read.dta("igf.dta")
+N    <- nrow(data)
+
+# ── Derived variables ─────────────────────────────────────────────────────────
+data <- data %>%
+  mutate(
+    log_lucent = log(lucent),
+    log_igfbp3 = log(igfbp3)
+  )
+
+glimpse(data)
+```
+
+------------------------------------------------------------------------
+
+## 1. Question 1 — Association of Lucent Area with Genotype
+
+We begin by testing whether the proposed instrument `igfbp3g` is
+associated with the outcome `log(lucent)`. Under the IV assumptions, any
+such association can only arise through the exposure `igfbp3`. A
+significant association is therefore consistent with (but does not
+prove) the existence of a causal effect of IGFBP-3 on breast density.
+
+```{r q1-outcome-iv-association}
+# ── Numeric coding of genotype ────────────────────────────────────────────────
+# AA = 1, AC = 2, CC = 3 (allele dose ordering)
+data <- data %>%
+  mutate(igfbp3g_num = as.numeric(igfbp3g))
+
+# ── Linear regression of log(lucent) on genotype (linear trend) ───────────────
+lm_q1 <- lm(log_lucent ~ igfbp3g_num, data = data)
+summary(lm_q1)
+
+# ── As a factor (no ordering assumed) ────────────────────────────────────────
+lm_q1_cat <- lm(log_lucent ~ factor(igfbp3g), data = data)
+summary(lm_q1_cat)
+
+# ── Pearson correlation ───────────────────────────────────────────────────────
+cor.test(data$log_lucent, data$igfbp3g_num)
+```
+
+> **Interpretation:** The genotype is significantly associated with
+> log(lucent area) ($p = 0.018$), with each additional C allele
+> corresponding to a decrease in log-lucent area of approximately 0.154.
+> Under the IV assumptions, this association propagates entirely through
+> IGFBP-3 levels — consistent with the instrument having a causal
+> downstream effect.
+
+------------------------------------------------------------------------
+
+## 2. Question 2 — Distribution of IGFBP-3 and Relevance of the Instrument
+
+We examine the distribution of the exposure and assess whether the
+instrument satisfies the **relevance** assumption — i.e., whether
+`igfbp3g` is associated with serum IGFBP-3 after (implicitly) adjusting
+for measured confounders. This is the only IV assumption directly
+testable from data.
+
+### 2.1 Histogram of IGFBP-3 (raw and log-transformed)
+
+```{r q2-histograms}
+p1 <- ggplot(data, aes(x = igfbp3)) +
+  geom_histogram(bins = 20, fill = "steelblue", alpha = 0.7, color = "white") +
+  theme_minimal() +
+  labs(x = "igfbp3", y = "Frequency", title = "Histogram of igfbp3")
+
+p2 <- ggplot(data, aes(x = log_igfbp3)) +
+  geom_histogram(bins = 20, fill = "steelblue", alpha = 0.7, color = "white") +
+  theme_minimal() +
+  labs(x = "log_igfbp3", y = "Frequency", title = "Histogram of log_igfbp3")
+
+p1 + p2
+```
+
+> The raw distribution of IGFBP-3 is right-skewed; the log
+> transformation yields an approximately symmetric distribution, making
+> it more suitable for linear models.
+
+### 2.2 Distribution of log(IGFBP-3) by genotype
+
+```{r q2-by-genotype}
+# ── Summary statistics by genotype ────────────────────────────────────────────
+data %>%
+  group_by(igfbp3g) %>%
+  summarise(
+    n    = n(),
+    mean = round(mean(log_igfbp3), 3),
+    sd   = round(sd(log_igfbp3), 3),
+    min  = round(min(log_igfbp3), 3),
+    max  = round(max(log_igfbp3), 3)
+  )
+
+# ── Overlapping histograms ────────────────────────────────────────────────────
+ggplot(data, aes(x = log_igfbp3, fill = igfbp3g, colour = igfbp3g)) +
+  geom_histogram(alpha = 0.4, position = "identity", bins = 20) +
+  scale_fill_manual(values  = c("tomato", "steelblue", "forestgreen")) +
+  scale_colour_manual(values = c("tomato", "steelblue", "forestgreen")) +
+  theme_minimal() +
+  labs(x = "log_igfbp3", y = "Count",
+       title = "Distribution of log(IGFBP-3) by genotype",
+       fill = "igfbp3g", colour = "igfbp3g")
+```
+
+### 2.3 Testing relevance
+
+```{r q2-relevance}
+# ── Linear regression of log(igfbp3) on genotype ─────────────────────────────
+lm_q2 <- lm(log_igfbp3 ~ igfbp3g_num, data = data)
+summary(lm_q2)
+
+# ── As factor, with F-test ────────────────────────────────────────────────────
+lm_q2_cat <- lm(log_igfbp3 ~ factor(igfbp3g), data = data)
+anova(lm_q2_cat)
+```
+
+> **Interpretation:** The genotype is significantly associated with
+> log(IGFBP-3) ($p = 0.009$), supporting the relevance assumption. Each
+> additional C allele is associated with a decrease of approximately
+> 0.063 in log(IGFBP-3). This is the only IV assumption directly
+> testable from data; the exclusion restriction and randomization
+> assumption require subject-matter justification.
+
+------------------------------------------------------------------------
+
+## 3. Question 3 — DAG and IV Assumptions
+
+```{r q3-dag}
+library(DiagrammeR)
+
+grViz("
+digraph IV_DAG {
+  graph [layout = neato, bgcolor = transparent, splines = curved]
+  node [shape = plaintext, fontname = 'Helvetica', fontsize = 16]
+  R [pos = '0,0!',  label = 'R\n(igfbp3g)']
+  A [pos = '3,0!',  label = 'A\n(log igfbp3)']
+  Y [pos = '6,0!',  label = 'Y\n(log lucent)']
+  U [pos = '4.5,2!', label = 'U']
+  L [pos = '3,-2!', label = 'L\n(age, afbcat,\nbrfcat, parcat, ev_pil)']
+
+  edge [arrowhead = vee, arrowsize = 0.8, penwidth = 1.6, color = '#444444']
+  R -> A
+  A -> Y
+  U -> A
+  U -> Y
+  L -> A
+  L -> Y
+
+  edge [arrowhead = vee, arrowsize = 0.7, penwidth = 1.2,
+        style = dashed, color = '#888888']
+  R -> Y [style = dashed, constraint = false]
+  R -> L [style = dashed]
+}
+")
+```
+
+The three IV assumptions in this setting are:
+
+1.  **Relevance** ($R \not\!\perp\!\!\!\perp A \mid L$): The IGFBP3g
+    genotype must be associated with serum IGFBP-3 levels after
+    adjusting for observed covariates $L$. This was verified empirically
+    in Question 2.
+
+2.  **Exclusion restriction** ($R \perp\!\!\!\perp Y \mid A, L, U$): The
+    genotype should not affect dense breast tissue area through any
+    pathway other than serum IGFBP-3. This assumption is *potentially
+    violated* if the genotype affects fertility-related traits (such as
+    parity or age at first birth), which in turn influence breast tissue
+    density.
+
+3.  **Randomization** ($R \perp\!\!\!\perp U \mid L$): The genotype is
+    randomized by Mendelian inheritance — transmission of alleles from
+    parent to offspring is random, so it should not share common causes
+    with the unmeasured confounders $U$ after conditioning on $L$. This
+    assumption is not testable from data and relies on biological
+    reasoning.
+
+------------------------------------------------------------------------
+
+## 4. Question 4 — IV Estimate via Efficient Influence Function (no covariates)
+
+We estimate $\psi$ using the EIF estimator without adjusting for any
+covariates $L$. In this case $\hat{E}(R \mid L) = \bar{R}$,
+$\hat{E}(A \mid L) = \bar{A}$, and $\hat{E}(Y \mid L) = \bar{Y}$, so the
+estimator reduces to:
+
+$$
+\hat{\psi} =
+\frac{\sum_i (R_i - \bar{R})(Y_i - \bar{Y})}
+     {\sum_i (R_i - \bar{R})(A_i - \bar{A})}
+$$
+
+```{r q4-iv-no-covariates}
+# ── Variables ─────────────────────────────────────────────────────────────────
+Y <- data$log_lucent
+A <- data$log_igfbp3
+R <- data$igfbp3g_num
+
+# ── EIF estimator (no covariates) ─────────────────────────────────────────────
+psi <- mean((R - mean(R)) * (Y - mean(Y))) /
+       mean((R - mean(R)) * (A - mean(A)))
+
+# ── Standard error via influence function ─────────────────────────────────────
+EIC_psi <- (R - mean(R)) * (Y - mean(Y) - psi * (A - mean(A))) /
+           mean((R - mean(R)) * (A - mean(A)))
+se_psi <- sd(EIC_psi) / sqrt(N)
+
+# ── 95% confidence interval ───────────────────────────────────────────────────
+psi_lb <- psi - 1.96 * se_psi
+psi_ub <- psi + 1.96 * se_psi
+
+# ── Results table (on geometric mean ratio scale for a 10% increase in A) ─────
+tibble(
+  Method    = "Eff. Influence Function",
+  Estimate  = format(round(exp(psi     * log(1.1)), 3), nsmall = 3),
+  CI_Lower  = format(round(exp(psi_lb  * log(1.1)), 3), nsmall = 3),
+  CI_Upper  = format(round(exp(psi_ub  * log(1.1)), 3), nsmall = 3)
+)
+```
+
+> **Interpretation:** A 10% increase in serum IGFBP-3 increases the
+> geometric mean of dense breast tissue area by approximately 26.1%
+> ($= \exp(\hat\psi \cdot \log 1.1)$) [95% CI: 0.1% to 58.9%]. The
+> confidence interval is wide, reflecting the limited sample size and
+> weak instrument strength.
+
+------------------------------------------------------------------------
+
+## 5. Question 5 — DML IV Estimate with Covariates (SuperLearner)
+
+A concern with the unadjusted IV estimate is that `parcat` and `afbcat`
+(parity and age at first birth) may lie on the causal pathway from
+genotype to outcome — violating the exclusion restriction. We address
+this by conditioning on $L = (\texttt{afbcat}, \texttt{parcat})$,
+thereby blocking that pathway.
+
+We use **Debiased Machine Learning** with SuperLearner to estimate the
+three nuisance functions $\hat{E}(Y \mid L)$, $\hat{E}(A \mid L)$ and
+$\hat{E}(R \mid L)$. Given the small sample ($n = 139$), cross-fitting
+is omitted and a restricted library is used.
+
+```{r q5-dml-iv}
+# ── Confounder set blocking the problematic pathway ───────────────────────────
+L <- data %>% dplyr::select(afbcat, parcat)
+
+SL.library <- c("SL.glm", "SL.ranger")
+
+# ── Nuisance models ───────────────────────────────────────────────────────────
+sl_Y <- SuperLearner(Y = Y, X = L, SL.library = SL.library)
+sl_A <- SuperLearner(Y = A, X = L, SL.library = SL.library)
+sl_R <- SuperLearner(Y = R, X = L, SL.library = SL.library)
+
+# ── Nuisance predictions ──────────────────────────────────────────────────────
+m_Y <- predict(sl_Y, newdata = L, onlySL = TRUE)$pred
+m_A <- predict(sl_A, newdata = L, onlySL = TRUE)$pred
+m_R <- predict(sl_R, newdata = L, onlySL = TRUE)$pred
+
+# ── EIF estimator with covariates ─────────────────────────────────────────────
+psi_L <- mean((R - m_R) * (Y - m_Y)) /
+         mean((R - m_R) * (A - m_A))
+
+# ── Standard error ────────────────────────────────────────────────────────────
+EIC_psi_L <- (R - m_R) * (Y - m_Y - psi_L * (A - m_A)) /
+             mean((R - m_R) * (A - m_A))
+se_psi_L  <- sd(EIC_psi_L) / sqrt(N)
+
+# ── 95% confidence interval ───────────────────────────────────────────────────
+psi_L_lb <- psi_L - 1.96 * se_psi_L
+psi_L_ub <- psi_L + 1.96 * se_psi_L
+
+# ── Results table ─────────────────────────────────────────────────────────────
+tibble(
+  Method   = "Eff. Influence Function",
+  Estimate = format(round(exp(psi_L    * log(1.1)), 3), nsmall = 3),
+  CI_Lower = format(round(exp(psi_L_lb * log(1.1)), 3), nsmall = 3),
+  CI_Upper = format(round(exp(psi_L_ub * log(1.1)), 3), nsmall = 3)
+)
+```
+
+> **Interpretation:** After conditioning on `afbcat` and `parcat` to
+> block the potentially problematic pathway from genotype to outcome, a
+> 10% increase in serum IGFBP-3 increases the geometric mean of dense
+> breast tissue area by approximately 24.9% [95% CI: 3.4% to 50.9%]. The
+> estimate is slightly attenuated relative to Question 4 and the
+> interval no longer includes zero.
+
+------------------------------------------------------------------------
+
+## 6. Question 6 — Assumption-Lean Regression (Comparison)
+
+For comparison, we estimate the **association** (not necessarily causal
+effect) between log(IGFBP-3) and log(lucent area) using
+**assumption-lean linear regression** — adjusting for the full
+confounder set $L = (\texttt{age}, \texttt{afbcat}, \texttt{brfcat},
+\texttt{parcat}, \texttt{ev\_pil})$. We use two equivalent approaches:
+
+-   The **EIF estimator** based on the partially linear model
+    $E(Y \mid A, L) = \beta A + g(L)$, which targets the coefficient
+    $\beta = E[(A - E(A \mid L))^2]^{-1} \cdot E[(A - E(A \mid L))(Y - E(Y \mid L))]$.
+-   The **OLS residual-on-residual regression** with
+    heteroskedasticity-robust (sandwich) standard errors.
+
+```{r q6-assumption-lean}
+# ── Full confounder set ───────────────────────────────────────────────────────
+L2 <- data %>% dplyr::select(age, afbcat, brfcat, parcat, ev_pil)
+
+# ── Nuisance models ───────────────────────────────────────────────────────────
+sl_Y2 <- SuperLearner(Y = Y, X = L2, SL.library = SL.library)
+sl_A2 <- SuperLearner(Y = A, X = L2, SL.library = SL.library)
+
+m_Y2 <- predict(sl_Y2, newdata = L2, onlySL = TRUE)$pred
+m_A2 <- predict(sl_A2, newdata = L2, onlySL = TRUE)$pred
+
+# ── EIF estimator ─────────────────────────────────────────────────────────────
+beta_eif <- mean((A - m_A2) * (Y - m_Y2)) /
+            mean((A - m_A2)^2)
+
+EIC_beta  <- (A - m_A2) * (Y - m_Y2 - beta_eif * (A - m_A2)) /
+             mean((A - m_A2)^2)
+se_eif    <- sd(EIC_beta) / sqrt(N)
+
+beta_eif_lb <- beta_eif - 1.96 * se_eif
+beta_eif_ub <- beta_eif + 1.96 * se_eif
+
+# ── OLS with sandwich SE ──────────────────────────────────────────────────────
+lm_resid  <- lm(I(Y - m_Y2) ~ -1 + I(A - m_A2))
+lm_result <- coeftest(lm_resid, vcov = sandwich)
+
+beta_lm    <- lm_result[1, 1]
+se_lm      <- lm_result[1, 2]
+beta_lm_lb <- beta_lm - 1.96 * se_lm
+beta_lm_ub <- beta_lm + 1.96 * se_lm
+
+# ── Combined results table ────────────────────────────────────────────────────
+tibble(
+  Method    = c("Linear Model", "Eff. Influence Function"),
+  Estimate  = format(round(exp(c(beta_lm,    beta_eif)    * log(1.1)), 3), nsmall = 3),
+  CI_Lower  = format(round(exp(c(beta_lm_lb, beta_eif_lb) * log(1.1)), 3), nsmall = 3),
+  CI_Upper  = format(round(exp(c(beta_lm_ub, beta_eif_ub) * log(1.1)), 3), nsmall = 3)
+)
+```
+
+> **Interpretation:** The assumption-lean regression estimates a much
+> smaller association: a 10% increase in IGFBP-3 is associated with a
+> 4.5% increase in the geometric mean of dense breast tissue area [95%
+> CI: −0.2% to 9.3%], which is not statistically significant. This
+> contrasts sharply with the IV estimates (\~25%), suggesting that
+> unmeasured confounding substantially attenuates the observational
+> association.
+
+------------------------------------------------------------------------
+
+## 7. Summary of Results
+
+```{r summary-table}
+results_all <- tibble(
+  Method = c(
+    "IV — EIF (no covariates)",
+    "IV — DML with covariates (SuperLearner)",
+    "Assumption-lean regression — LM",
+    "Assumption-lean regression — EIF"
+  ),
+  Estimate = format(round(exp(c(psi, psi_L, beta_lm, beta_eif) * log(1.1)), 3), nsmall = 3),
+  CI_Lower = format(round(exp(c(psi_lb,    psi_L_lb, beta_lm_lb, beta_eif_lb) * log(1.1)), 3), nsmall = 3),
+  CI_Upper = format(round(exp(c(psi_ub,    psi_L_ub, beta_lm_ub, beta_eif_ub) * log(1.1)), 3), nsmall = 3)
+)
+
+print(results_all)
+```
+
+```{r forest-plot}
+tibble(
+  Method   = c(
+    "IV — EIF (no covariates)",
+    "IV — DML with covariates",
+    "Assumption-lean (LM)",
+    "Assumption-lean (EIF)"
+  ),
+  Estimate = exp(c(psi, psi_L, beta_lm, beta_eif) * log(1.1)),
+  Lower    = exp(c(psi_lb, psi_L_lb, beta_lm_lb, beta_eif_lb) * log(1.1)),
+  Upper    = exp(c(psi_ub, psi_L_ub, beta_lm_ub, beta_eif_ub) * log(1.1))
+) %>%
+  mutate(Method = factor(Method, levels = rev(Method))) %>%
+  ggplot(aes(x = Estimate, y = Method)) +
+  geom_point(size = 3, color = "tomato") +
+  geom_errorbarh(aes(xmin = Lower, xmax = Upper),
+                 height = 0.25, linewidth = 0.8, color = "tomato") +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1,
+                                                      scale = 100)) +
+  theme_minimal() +
+  labs(x = "Geometric mean ratio (10% increase in IGFBP-3)",
+       y   = NULL,
+       title = "IV and regression estimates — IGFBP-3 effect on breast density")
+```
+
+> **Overall conclusion:** The IV estimates suggest a substantial
+> positive causal effect of serum IGFBP-3 on dense breast tissue area,
+> with a 10% increase in IGFBP-3 associated with roughly a 25% increase
+> in the geometric mean lucent area. The assumption-lean regression
+> estimate is substantially smaller and non-significant, pointing to
+> negative unmeasured confounding that masks the causal effect in a
+> standard observational analysis. The IV confidence intervals are wide
+> due to the modest instrument strength and small sample, so results
+> should be interpreted with caution.

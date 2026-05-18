@@ -1,0 +1,1058 @@
+---
+title: "Causal Machine Learning Project"
+author: "Carlos Rodriguez Ameal and Michelina Pizzocaro"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    keep_tex: true
+    toc: false
+    toc_depth: 2
+  word_document:
+    toc: true
+    toc_depth: 2
+  html_document:
+    toc: true
+    toc_depth: '2'
+    df_print: paged
+header-includes: 
+  - \renewcommand{\normalsize}{\fontsize{10}{10}\selectfont}
+  - \usepackage{amsmath}
+  - \usepackage{float}
+  - \usepackage[font=small]{caption}
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, 
+                      include = FALSE,
+                      fig.pos = "H",
+                      fig.align = "center",
+                      warning = FALSE)
+```
+
+```{r}
+library(patchwork)
+library(hdm)
+library(gridExtra)
+library(SuperLearner)
+library(tmle)
+library(npcausal)
+library(sandwich)
+library(AIPW)
+library(ggplot2)
+library(knitr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(xgboost)
+library(caret)
+library(glmnet)
+library(ggpmisc)
+library(tinytex)
+library(speedglm)
+library(earth)
+library(ranger)
+library(kableExtra)
+
+data(pension)
+#source("functions.R")
+```
+
+```{r}
+# Parallelizzazione with future
+library(future)
+library(future.apply)
+plan(multisession, workers = parallel::detectCores() - 1) 
+```
+
+
+
+
+\newpage 
+
+**Exercise 1**
+
+```{r, echo=FALSE, out.width="60%", fig.align="center"}
+knitr::include_graphics("objects/dag.png")
+```
+
+The DAG in **Figure 1** illustrates the assumed causal relationship between 401(k) participation and net financial assets. The list of variables is a follows. \( Y \): Net financial assets (the outcome);\( A \): Eligibility for participating in a 401(k) plan (eligibility); \( P \): Actual participation in the 401(k) plan; \( L \): Income (an observed covariate); \( S \): Propensity to save (unobserved).
+
+```{r, include=TRUE, echo=FALSE, fig.show='hold', out.width=c('26.3%', '33%'), fig.align="center", fig.cap="Causal framework illustrating: (a) the proposed Directed Acyclic Graph (DAG) depicting the causal relationships in our setting when conditioning on L; and (b) the corresponding Single World Intervention Graph (SWIG) under intervention on variable A, showing that the conditional exchangeability assumption holds"}
+knitr::include_graphics(c("objects/dag.png","objects/dag2.jpeg"))
+```
+
+
+\noindent
+This DAG allows for the most general case where the propensity to save, \( S \), may affect eligibility (through income), participation and net assets. Note that \( S \) can be conceptualized to include every unobserved variable that may affect \( A \) through \( L \). This setting implies that there would be confounding bias if we wanted to estimate the effect of \( P \) on \( Y \). However, we can sort this by changing the focus to the effect of \( A \) on \( Y \). If the reasoning that \( S \) affects \( Y \) only through the mediation of \( L \) holds, then there exists a backdoor path between \( A \) and \( Y \) through \( L \) that we can block by conditioning on \( L \). This would result in \( S \) no longer being associated with \( A \) and therefore not acting as a confounder for the estimation of the effect of \( A \) on \( Y \). Thus, conditional exchangeability, $Y^a \perp\!\!\!\perp A \mid L$, holds.
+
+
+**Exercise 2**
+
+We estimated nuisance parameters for the outcome and treatment models using SuperLearner with 10-fold cross-fitting. The library used in this and the following questions will be composed of the following learners: SL.speedglm, SL.earth, SL.ranger, and SL.gam. The plots display the distribution of estimated propensity scores and inverse probability weights (IPW) by treatment group. Boxplots are used to assess covariate overlap and identify potential weight instability, supporting diagnostics for the positivity assumption (see **Figure 2**).
+
+
+
+
+```{r}
+# Data
+Y <- pension$net_tfa
+A <- pension$p401
+X <- pension[, c("age", "inc", "fsize", "educ", "marr", "twoearn", "db", "ira", "hown")]
+
+# SuperLearner
+sl_lib <- c("SL.speedglm", "SL.earth", "SL.ranger", "SL.gam")
+```
+
+
+```{r, eval=FALSE}
+# AIPW ATE - ATT
+set.seed(42)
+plan(multisession, workers = parallel::detectCores() - 1)
+aipw_ate = ate(y=Y, a=A, x=X, nsplits=10, sl.lib = sl_lib)
+se_ate = aipw_ate$res[3,3]
+aipw_att = att(y=Y, a=A, x=X, nsplits=10, sl.lib = sl_lib)
+se_att = aipw_ate$res[3,3]
+```
+
+```{r}
+#saveRDS(aipw_ate, file = "aipw_ate.rds")
+#saveRDS(aipw_att, file = "aipw_att.rds")
+aipw_att <- readRDS("objects/aipw_att.rds")
+aipw_ate <- readRDS("objects/aipw_ate.rds")
+```
+
+
+
+```{r}
+diagnostic_df <- data.frame(
+  A = A,
+  pscore = aipw_ate$nuis$pi_a1,
+  weight = A / aipw_ate$nuis$pi_a1 + (1 - A) / (1 - aipw_ate$nuis$pi_a1)
+)
+
+# --- Propensity Score Distribution ---
+diagnostic_df$Eligibility <- factor(diagnostic_df$A, labels = c("Not Eligible", "Eligible"))
+
+# Density plot
+g1 <- ggplot(diagnostic_df, aes(x = pscore, fill = factor(A))) +
+  geom_density(alpha = 0.4) +
+  labs(title = "Propensity Score Density",
+       x = "Propensity Score",
+       fill = "p401 (Treatment)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) 
+
+# Boxplot
+g2 <- ggplot(diagnostic_df, aes(x = Eligibility, y = pscore, fill = Eligibility)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Propensity Score",
+       x = NULL,
+       y = "Propensity Score",
+       fill = "Eligibility") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+
+# --- Inverse Probability Weight Distribution ---
+
+# Density plot
+g3 <- ggplot(diagnostic_df, aes(x = weight, fill = factor(A))) +
+  geom_density(alpha = 0.5) +
+  labs(title = "(IPW) Density",
+       x = "IPW Weight",
+       fill = "p401 (Treatment)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+# Boxplot
+g4 <- ggplot(diagnostic_df, aes(x = Eligibility, y = weight, fill = Eligibility)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Inverse Probability Weights",
+       x = NULL,
+       y = "IPW Weight",
+       fill = "Eligibility") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+```
+
+```{r}
+grid.arrange(g1, g3, ncol = 2) 
+```
+
+
+```{r, include=TRUE, fig.cap="Distribution of propensity score and IPW Weight", out.width="35%"}
+(g2 + g4) + plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+```
+The propensity score distributions exhibit some degree of overlap between the two groups. However, the distributions are clearly shifted, indicating systematic differences in covariates between eligible and non-eligible individuals.
+
+Additionally, although the inverse probability weights (IPW) for the treated group exhibit some skewness, the maximum weight value is approximately $20$ in a sample of $9915$ observations, with only four other weights being higher than $15$. Since there is no universally accepted threshold, it is hard to decide if the positivy assumption is violated. In any case, we consider that this a non-extreme setting and that it does not raise major concerns about the estimator instability, so ATE should be quite reliably estimated and there would be no need to restrict ourselves to the estimation of the ATT (as it is common practice when positivity does not hold). However, using IPW or TMLE instead of IPW is still a good idea, so we benefit from the double-robustness property and we mitigate our dependency on the stability of the propensity score.
+
+
+```{r}
+# TMLE ATE
+set.seed(42)
+plan(multisession, workers = parallel::detectCores() - 1)
+Q <- cbind(aipw_ate$nuis$mu_a0, aipw_ate$nuis$mu_a1)
+ate.tmle <- tmle(Y, A, X, Q = Q, g1W = aipw_ate$nuis$pi_a1)
+ate_tmle <- ate.tmle$estimates$ATE$psi
+se_tmle_ate <- sqrt(ate.tmle$estimates$ATE$var.psi)
+
+ate_tmle_lb <- ate.tmle$estimates$ATE$CI[1]
+ate_tmle_ub <- ate.tmle$estimates$ATE$CI[2]
+```
+
+
+```{r}
+# Confidence Intervals for ATE
+ci_ate_aipw <- c(aipw_ate$res[3,4], aipw_ate$res[3,5])
+ci_ate_tmle <- c(ate_tmle_lb, ate_tmle_ub)
+```
+
+
+```{r}
+# TMLE ATT 
+set.seed(42)
+plan(multisession, workers = parallel::detectCores() - 1)
+#att.tmle <- tmle(Y, A, X, Q = Q, g1W = aipw_ate$nuis$pi_a1, V.Q = 10, V.g = 10)
+att.tmle = ate.tmle
+att_tmle <- att.tmle$estimates$ATT$psi
+se_tmle_att <- sqrt(att.tmle$estimates$ATT$var.psi)
+
+att_tmle_lb <- att.tmle$estimates$ATT$CI[1]
+att_tmle_ub <- att.tmle$estimates$ATT$CI[2]
+
+```
+
+
+```{r}
+# Confidence Intervals for ATT
+ci_att_aipw <- c(aipw_att$res[3,4], aipw_att$res[3,5])
+ci_att_tmle <- c(att_tmle_lb, att_tmle_ub)
+```
+
+
+
+```{r}
+# ---Results---
+results_table <- data.frame(
+  Estimator = c("AIPW ATE", "TMLE ATE", "AIPW ATT", "TMLE ATT"),
+  Estimate = round(c(aipw_ate$res[3,2], ate_tmle,
+                     aipw_att$res[3,2], att_tmle), 2),
+  SE = round(c(aipw_ate$res[3,3], se_tmle_ate,
+               aipw_att$res[3,3], se_tmle_att), 2),
+  CI_Lower = round(c(ci_ate_aipw[1], ci_ate_tmle[1],
+                     ci_att_aipw[1], ci_att_tmle[1]), 2),
+  CI_Upper = round(c(ci_ate_aipw[2], ci_ate_tmle[2], 
+                     ci_att_aipw[2], ci_att_tmle[2]), 2)
+)
+```
+
+
+```{r, include=FALSE, results='asis', message=FALSE}
+
+kable(results_table, caption = "Summary of ATE and ATT Estimates with 95% Confidence Intervals")
+
+```
+
+
+
+```{r}
+n <- length(Y)
+
+# Propensity score naive (costante)
+pihat_naive <- rep(mean(A), n)
+
+# Outcome regressions naive
+mu0_naive <- rep(mean(Y[A == 0]), n)
+mu1_naive <- rep(mean(Y[A == 1]), n)
+
+# Outcome model predictions
+muhat_naive <- data.frame(
+  mu0 = mu0_naive,
+  mu1 = mu1_naive,
+  mu = mean(Y)
+)
+```
+
+
+```{r}
+# --- AIPW naive ATE ---
+aipw_ate_naive <- (1 / n) * sum(
+  (A * (Y - muhat_naive$mu1) / pihat_naive) -
+  ((1 - A) * (Y - muhat_naive$mu0) / (1 - pihat_naive)) +
+  (muhat_naive$mu1 - muhat_naive$mu0)
+)
+
+# Influence function and SE for ATE
+IF_ate_naive <- (
+  (A * (Y - muhat_naive$mu1) / pihat_naive) -
+  ((1 - A) * (Y - muhat_naive$mu0) / (1 - pihat_naive)) +
+  (muhat_naive$mu1 - muhat_naive$mu0) -
+  aipw_ate_naive
+)
+se_aipw_ate_naive <- sd(IF_ate_naive) / sqrt(n)
+
+# --- AIPW naive ATT ---
+P_A1 <- mean(A)
+
+aipw_att_naive <- (1 / n) * sum(
+  (A / P_A1) * (Y - muhat_naive$mu0) -
+  ((1 - A) * pihat_naive / ((1 - pihat_naive) * P_A1)) * (Y - muhat_naive$mu0)
+)
+
+# Influence function and SE for ATT
+IF_att_naive <- (A / P_A1) * (Y - muhat_naive$mu0 - aipw_att_naive) -
+                 ((1 - A) * pihat_naive / ((1 - pihat_naive) * P_A1)) * (Y - muhat_naive$mu0)
+se_aipw_att_naive <- sd(IF_att_naive) / sqrt(n)
+```
+
+```{r}
+g = pihat_naive
+Q0 = muhat_naive$mu0
+Q1 = muhat_naive$mu1
+n <- length(A)
+```
+
+
+```{r}
+# --- TMLE ATT ---
+fluctmod_att <- lm(Y[A == 0] ~ -1 + offset(Q0[A == 0]) + I(g[A == 0] / (1 - g[A == 0])))
+
+# Updated predictions
+Q1_star_att <- Q0 + as.numeric(fluctmod_att$coef) * g / (1 - g)
+
+# TMLE ATT estimate
+tmle_att_naive <- mean((A / mean(A)) * (Y - Q1_star_att))
+
+# Influence function TMLE ATT
+IC_tmle_att_naive <- (A / mean(A)) * (Y - Q1_star_att - tmle_att_naive) -
+                     ((1 - A) * g / (1 - g)) * (Y - Q1_star_att) / mean(A)
+
+se_tmle_att_naive <- sd(IC_tmle_att_naive) / sqrt(n)
+```
+
+
+```{r}
+# --- TMLE ATE ---
+fluctmod_ate <- lm(
+  Y ~ -1 + offset(A * Q1 + (1 - A) * Q0) +
+    I(A / g) +
+    I((1 - A) / (1 - g)),
+  family = gaussian()
+)
+
+# Updated predictions
+epsilon_ate <- coef(fluctmod_ate)
+Q1_star_ate <- Q1 + epsilon_ate["I(A/g)"]
+Q0_star_ate <- Q0 + epsilon_ate["I((1 - A)/(1 - g))"]
+
+# TMLE ATE estimate
+tmle_ate_naive <- mean(Q1_star_ate - Q0_star_ate)
+
+# Influence function TMLE ATE
+IC_tmle_ate_naive <- (Q1_star_ate - Q0_star_ate) - tmle_ate_naive +
+                     (A / g) * (Y - Q1) -
+                     ((1 - A) / (1 - g)) * (Y - Q0)
+
+se_tmle_ate_naive <- sd(IC_tmle_ate_naive) / sqrt(n)
+
+```
+
+```{r}
+naive_ate <- mean(muhat_naive$mu1-muhat_naive$mu0)
+
+mean1 <- mean(muhat_naive$mu1)
+mean0 <- mean(muhat_naive$mu0)
+
+p1 <- mean(A)
+p0 <- 1 - p1
+
+# Influence function 
+influence_naive <- (A / p1) * (Y - mean1) - ((1 - A) / p0) * (Y - mean0)
+
+# Standard error
+se_naive_ate <- sd(influence_naive) / sqrt(n)
+
+```
+
+```{r}
+# Results table: no covariate adjustment
+results_table_naive <- data.frame(
+  Estimator = c(
+    "AIPW ATE (no covariates)", "TMLE ATE (no covariates)",
+    "AIPW ATT (no covariates)", "TMLE ATT (no covariates)",
+    "Naive ATE-ATT (without Covariate Adjustment)"
+  ),
+  Estimate = round(c(
+    aipw_ate_naive, tmle_ate_naive,
+    aipw_att_naive, tmle_att_naive,
+    naive_ate
+  ), 2),
+  SE = round(c(
+    se_aipw_ate_naive, se_tmle_ate_naive,
+    se_aipw_att_naive, se_tmle_att_naive,
+    se_naive_ate
+  ), 2),
+  CI_Lower = round(c(
+    aipw_ate_naive - 1.96 * se_aipw_ate_naive,
+    tmle_ate_naive - 1.96 * se_tmle_ate_naive,
+    aipw_att_naive - 1.96 * se_aipw_att_naive,
+    tmle_att_naive - 1.96 * se_tmle_att_naive,
+    naive_ate - 1.96 * se_naive_ate
+  ), 2),
+  CI_Upper = round(c(
+    aipw_ate_naive + 1.96 * se_aipw_ate_naive,
+    tmle_ate_naive + 1.96 * se_tmle_ate_naive,
+    aipw_att_naive + 1.96 * se_aipw_att_naive,
+    tmle_att_naive + 1.96 * se_tmle_att_naive,
+    naive_ate + 1.96 * se_naive_ate
+  ), 2)
+)
+
+```
+
+
+```{r, include=TRUE, results='asis', message=FALSE}
+
+kable(rbind(results_table, results_table_naive[5,]), caption = "Summary of ATE and ATT Estimates with 95% Confidence Intervals")
+
+```
+
+```{r, include=FALSE}
+library(knitr)
+
+kable(results_table_naive, caption = "Summary of ATE and ATT Estimates without Covariate Adjustment (with 95% Confidence Intervals)")
+
+```
+
+Considering the estimates adjusted for covariates, the results are coherent across both AIPW and TMLE, with ATE estimates around $11,300$ and ATT estimates around $15,300$. The higher ATT values indicate that the treatment effect is stronger for individuals who were actually eligible, a result that seems plausible as people with better job benefits and conditions would also profit more from a tax-advantaged saving plan.
+
+As predicted by theory, in the naïve implementation without covariate adjustment, the AIPW and TMLE estimators for both ATT and ATE, as well as the simple difference in means, all produce identical results. This happens because both the propensity score and outcome models are specified as constants, causing the estimators to reduce to the basic difference in group means.
+
+Compared to the naïve ATE estimate of $27,372$ ($SE = 1,682$), the AIPW and TMLE estimates are substantially lower, around $11,300$ for ATE and $15,370$ for ATT. This large difference highlights the importance of adjusting for confounding variables. The naïve estimator likely overstates the treatment effect because it does not account for baseline differences between eligible and non-eligible individuals. 
+
+**Exercise 3**
+
+Because the efficient influence function of  $\theta = E(Cov(A,Y|L))$ is given by
+$$(A−E(A|L))(Y−E(Y|L))−\theta$$
+we can estimate $\theta$ by setting : 
+
+$$ \hat{\theta}= \frac{1}{n} \sum_{i=1}^n (A_i−E(A_i|W_i))(Y_i−E(Y_i|W_i))$$
+
+```{r}
+generate_folds <- function(n, cv_folds) {
+  inds <- sample(rep(1:cv_folds, ceiling(n/cv_folds))[1:n])
+  return(inds)
+}
+
+estimate_mu_nonpar <- function(Y, A, X, sl_lib, family = 'binomial', nsplits=NULL, 
+                               split_inds=NULL, ...) {
+  if (is.null(nsplits) & is.null(split_inds)) {
+    stop("One of nsplits or split_inds must be provided.")
+  }
+  set.seed(42)
+  if (is.null(split_inds)) {
+    split_inds <- generate_folds(length(A), nsplits)
+  }
+  else {
+    nsplits = length(unique(split_inds))
+  }
+  XA <- as.data.frame(cbind(X, A))
+  X <- as.data.frame(X)
+  n <- length(A)
+  muhat <- as_tibble(matrix(0, nrow = n, ncol = 3,
+                            dimnames = list(c(), c("mu0", "mu1", "mu"))))
+  coefs <- rep(0, length(sl_lib))
+  
+  for (vfold in 1:nsplits) {
+    train <- split_inds != vfold
+    test <- split_inds == vfold
+    if (nsplits == 1) {
+      train <- test
+    }
+    model0 <- SuperLearner(Y[(A == 0) & train], X[(A == 0) & train, ],
+                           newX = X[test, ], family = family, SL.library = sl_lib, ...)
+    muhat[test, "mu0"] <- model0$SL.predict
+    coefs <- coefs + model0$coef
+    model1 <- SuperLearner(Y[(A == 1) & train], X[(A == 1) & train, ],
+                           newX = X[test, ], family = family, SL.library = sl_lib, ...)
+    muhat[test, "mu1"] <- model1$SL.predict
+    coefs <- coefs + model1$coef
+  }
+  coefs <- coefs/(2*nsplits)
+  muhat <- muhat %>%
+    mutate(mu = A*mu1 + (1 - A)*mu0)
+  
+  return(list(preds = muhat, coefs = coefs))
+}
+
+```
+
+
+```{r, eval=FALSE}
+# Cross-fitting setup
+set.seed(42)
+nsplits <- 10
+split_inds <- generate_folds(length(Y), nsplits)
+
+# Nuisance Estimation
+plan(multisession, workers = parallel::detectCores() - 1)  
+mu_fit <- estimate_mu_nonpar(Y, A, X, sl_lib, family = "gaussian", split_inds = split_inds)
+muhat <- mu_fit$preds
+```
+
+```{r}
+#saveRDS(mu_fit, file = "mu_fit2.rds")
+mu_fit <- readRDS("objects/mu_fit2.rds")
+muhat <- mu_fit$preds
+```
+
+
+```{r}
+# 1. Estimate theta
+pihat = aipw_att$nuis$pi
+
+theta_hat <- mean((A - pihat) * (Y - muhat$mu))
+
+# 2. Influence function
+phi <- (A - pihat) * (Y - muhat$mu) - theta_hat
+
+# 3. Standard error
+se_theta <- sd(phi) / sqrt(n)
+
+# 4. 95% Confidence Interval
+ci_theta <- c(theta_hat - 1.96 * se_theta, theta_hat + 1.96 * se_theta)
+
+# 5. p-value for H0: theta = 0
+z_score <- theta_hat / se_theta
+p_value <- 2 * (1 - pnorm(abs(z_score)))
+
+# 6. Output
+theta_table <- data.frame(
+  Parameter = "E[Cov(A, Y | L)]",
+  Estimate = round(theta_hat, 4),
+  SE = round(se_theta, 4),
+  CI_Lower = round(ci_theta[1], 4),
+  CI_Upper = round(ci_theta[2], 4),
+  p_value = signif(p_value, 4)
+)
+```
+
+
+```{r, include=TRUE, results='asis', message=FALSE, warning=FALSE}
+
+library(knitr)
+
+kable(theta_table, caption = "Estimation of E[Cov(A, Y | L)] with 95% Confidence Interval")
+
+```
+Based on the estimated conditional covariance $E[Cov(A,Y∣L)]$, we find no statistical evidence of a residual association between 401(k) eligibility (A) and net financial assets (Y) after adjusting for covariates (X). The estimate is positive (8.52), with a large standard error (243.29) and a wide 95% confidence interval that includes zero (−468.33 to 485.37). The p-value (0.9721) strongly suggests that any observed association is not statistically significant.
+
+
+```{r}
+phi_df <- data.frame(phi = phi)
+
+# Histogram of the influence function
+a = ggplot(phi_df, aes(x = phi)) +
+  geom_histogram(aes(y = ..density..), bins = 40, fill = NA, color = NA, alpha = 0.7) +
+  geom_density(color = "darkred", size = 1) +
+  labs(
+    title = "Density ",
+    x = "Value of Influence Function",
+    y = "Density"
+  ) +
+  theme_minimal()
+
+# Boxplot of the influence function
+b = ggplot(phi_df, aes(y = phi)) +
+  geom_boxplot(fill = "lightblue", color = "darkblue", outlier.color = "darkred", outlier.shape = 16) +
+  labs(
+    title = "Boxplot",
+    y = "Value of Influence Function"
+  ) +
+  theme_minimal()
+
+
+```
+
+```{r, include=TRUE, fig.cap="Distribution of Influence Function", out.width="35%"}
+a + b
+```
+The plots in **Figure 3** clearly reveal that the distribution of the influence function is extremely peaked around zero but exhibits very heavy tails. The boxplot shows a large number of extreme outliers on both sides, confirming the presence of high-influence observations. These extreme values explain the inflated standard error and overly wide confidence interval observed when using the full influence curve.
+
+```{r}
+# trimming
+lower <- quantile(phi, 0.01)
+upper <- quantile(phi, 0.99)
+phi_trimmed <- phi[phi >= lower & phi <= upper]
+
+se_theta <- sd(phi_trimmed) / sqrt(length(phi_trimmed))
+
+```
+
+```{r}
+
+
+# 4. 95% Confidence Interval
+ci_theta <- c(theta_hat - 1.96 * se_theta, theta_hat + 1.96 * se_theta)
+
+# 5. p-value for H0: theta = 0
+z_score <- theta_hat / se_theta
+p_value <- 2 * (1 - pnorm(abs(z_score)))
+
+# 6. Output
+theta_table <- data.frame(
+  Parameter = "E[Cov(A, Y | L)]",
+  Estimate = round(theta_hat, 4),
+  SE = round(se_theta, 4),
+  CI_Lower = round(ci_theta[1], 4),
+  CI_Upper = round(ci_theta[2], 4),
+  p_value = signif(p_value, 4)
+)
+```
+
+```{r, include=FALSE, results='asis', message=FALSE, warning=FALSE}
+
+library(knitr)
+
+kable(theta_table, caption = "Estimation of E[Cov(A, Y | L)] with 95% Confidence Interval")
+
+```
+<!--Trimming the influence function by excluding the lowest and highest 1% of its values substantially reduces the standard error, from 243.29 to 101.74. As a result, the 95% confidence interval narrows considerably—from [−468.33 ; 485.37] to [−190.89 ; 207.93]. This confirms that a small number of extreme observations have a strong impact on the variability of the estimate, and that trimming improves the stability of the inference.
+Despite this the p-value remains large in both cases. Therefore, the conclusion of the hypothesis test does not change: we do not find evidence against the null hypothesis that $E[Cov(A, Y | L)] = 0$.-->
+
+
+**Exercise 4**
+ 
+```{r, echo = FALSE}
+# Attaching the dataset
+data(pension)
+#?pension
+n <- pension$ira %>% length()
+
+# Reaniming of the variables
+Y <- pension$net_tfa # Outcome variable
+A <- pension$e401 # Treatment variable
+X <- pension[, c("age", "inc", "fsize", "educ", "marr", "twoearn", "db", "pira", "hown")] # Full set of controls
+W <- pension[, c("age", "inc", "educ")] # Prediciton variables for questions 4 and 5
+```
+In this exercise we will use 10-fold cross-fitting to construct the pseudo outcome and the weights of the R-learner, respectively $\tilde{Y}_{i} = \frac{Y_i - \hat{E}(Y_i \mid X_i)}{A_i - \hat{E}(A_i \mid X_i)}$ and $W_i = \left(A_i - \hat{E}(A_i \mid X_i)\right)^2$. To do so, for every given fold, we have relied on two SuperLearners to fit the propensity and the outcome models on the 9-training folds and using the whole set of covariates listed in question 2. From now on we will refer to this full set if variables as $X$. Then, we estimate a new Superlearner to predict these weighted pseudo-outcomes but only as a function of age, income and education. We refer to this subset as $W$ and to these predictions by $\hat{\tau}(W)$. The orthogonality property ensures that the error in the estimation of the nuisance parameters, $\hat{E}(A_i \mid X_i)$ and $\hat{E}(Y_i \mid X_i)$, has a mitigated effect in the quality of our estimates. As $n$ increases, we would expect our estimates to perform as well as if the real outcome and propensity models were used. 
+
+In **Figure 4** we show the histogram of the marginal distribution of our CATE estimates $\hat{\tau}(W)$. We also show the scatterplots when plotted against age, income and years of education. We include in them the line resulting from fitting a Simple Linear Regression with intercept and we show the coefficients estimates to quantitatively analyze the association with every variable. To allow for a more general relation we also add a LOESS line. Due to the presence of extreme values in the original variable of $Y$, our estimates $\hat{\tau}(W)$ also show some extreme behavior for the 1% lowest and highest quantiles of their marginal distribution, which complicated the readability of the plots and had too strong an influence on the regressions. Therefore we have removed these observations before creating the plots.  
+
+From studying the histogram we see that the effects of eligibility on savings show a mainly positive unimodal distribution, with median a bit lower than $5k$ gains. The distribution is positively skewed with a long right-tail that is cut from the exclution of the top 1%. With respect to the scatterplots of the effect of eligibility vs the individual variables of $W$ we observe a positive association for both income and age. This is hardly surprising, as we would expect people with higher incomes to benefit the most from a 401(k) plan. Older people usually have higher incomes and a longer time period to benefit from the plan so the positive trend is also expectable. However, following a similar reasoning, we would also expect a positive effect of education, which is not clearly seen in the plot.
+
+```{r, echo = FALSE, eval=FALSE}
+# Initializing the pseudo-outcomes and the weights
+y_tilde <- rep(0,n)
+weights <- rep(0,n)
+
+# Computation of the propensity score using a SuperLearner
+
+# Set up 10-fold cross-fitting
+folds <- createFolds(1:n, k = 10)
+
+
+# Use foreach to loop through the folds in parallel
+results <- foreach(k = 1:10, .packages = c("SuperLearner", "caret")) %dopar% {
+  # Select training and validation data
+  train_idx <- unlist(folds[-k])
+  val_idx <- unlist(folds[k])
+  
+  # Model for Y
+  mu_fit <- SuperLearner(Y = Y[train_idx], X = X[train_idx, ], SL.library = sl_lib, family = gaussian())
+  mu_hat <- predict(mu_fit, newdata = X[val_idx, ])$pred
+  
+  # Propensity score
+  e_fit <- SuperLearner(Y = A[train_idx], X = X[train_idx, ], SL.library = sl_lib, family = binomial())
+  e_hat <- predict(e_fit, newdata = X[val_idx, ])$pred
+  
+  # Calculate pseudo-outcome and weights
+  yt <- (Y[val_idx] - mu_hat) / (A[val_idx] - e_hat)
+  w <- (A[val_idx] - e_hat)^2
+  
+  list(indices = val_idx, y_tilde = yt, weights = w)
+}
+
+stopCluster(cl)
+
+
+
+# Recombine results
+for (res in results) {
+  y_tilde[res$indices] <- res$y_tilde
+  weights[res$indices] <- res$weights
+}
+
+save(y_tilde, file = "~/Courses/CML/Project/Question_4/y_tilde.RData")
+save(weights, file = "~/Courses/CML/Project/Question_5/weights.RData")
+```
+
+
+```{r, echo = FALSE, eval=FALSE}
+load("~/Courses/CML/Project/Question_4/y_tilde.RData")
+load("~/Courses/CML/Project/Question_5/weights.RData")
+```
+
+```{r, echo = FALSE, eval=FALSE}
+# Compute the final predictions for the pseudo-outocome using the variables in W
+final_model <- SuperLearner(
+  Y = y_tilde,
+  X = W,
+  SL.library = sl_lib,
+  family = gaussian(),
+  obsWeights = weights  # weights vector from earlier
+)
+predictions <- predict(final_model, newdata = W)$pred
+save(predictions,file = "~/Courses/CML/Project/Question_4/predictions.RData")
+```
+
+```{r, echo = FALSE}
+load("objects/predictions.RData")
+```
+
+```{r, message= FALSE, echo = FALSE, fig.width = 2, fig.height = 1.5, warning = FALSE, fig.cap="Histogram of our CATE estimates", include=TRUE}
+# Creating the dataframe for the plots
+df <- data.frame(predictions = predictions, income = W$inc, age = W$age, educ = W$educ)
+
+# Calculate the 2.5th and 97.5th percentiles
+lower_bound <- quantile(predictions, 0.01)
+upper_bound <- quantile(predictions, 0.99)
+
+# Filter predictions to exclude the extreme 2.5% on both ends
+df_filtered <- df[df$predictions >= lower_bound & df$predictions <= upper_bound, ]
+
+# Generate the histogram
+p1 <- ggplot(df_filtered, aes(x = predictions)) +
+  geom_histogram(
+    bins = 30,
+    fill = "#69b3a2",
+    color = "white",
+    alpha = 0.8
+  ) +
+  labs(
+    title = expression("Distribution of " ~ hat(tau)(W)),
+    x = "Predicted Value",
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 6)
+```
+
+```{r, echo = FALSE, message = FALSE, warning= FALSE, fig.width = 2, fig.height = 1.5, warning = FALSE, fig.cap="Scatterplot of the estimated CATE vs Income, include=TRUE"}
+p2 <- ggplot(df_filtered, aes(x = income, y = predictions)) +
+  # Scatter plot of data points
+  geom_point(alpha = 0.25, size = 0.1) +
+  
+  # LOESS curve for general trend
+  geom_smooth(method = "loess", se = FALSE, color = "darkblue", size = 0.5) +
+  
+  # Linear regression line
+  geom_smooth(method = "lm", se = FALSE, color = "black", linetype = "dashed", size = 0.5) +
+  
+  # Regression equation and R² annotation
+  stat_poly_eq(
+    aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")),
+    formula = y ~ x,
+    parse = TRUE,
+    label.x.npc = "left",
+    label.y.npc = 0.95,
+    size = 2.5,
+    color = "black"
+  ) +
+  
+  # Plot labels and theme
+  labs(
+    title = "Estimated Treatment Effect vs. Income",
+    x = "Income",
+    y = "Estimated Treatment Effect"
+  ) +
+  theme_minimal(base_size = 6)
+```
+
+```{r, echo = FALSE, message = FALSE, warning= FALSE, fig.width = 2, fig.height = 1.5, warning = FALSE, fig.cap="Scatterplot of the estimated CATE vs Age", include=TRUE}
+p3 <- ggplot(df_filtered, aes(x = age, y = predictions)) +
+  # Scatter plot of data points
+  geom_point(alpha = 0.25, size = 0.1) +
+  
+  # LOESS curve for general trend
+  geom_smooth(method = "loess", se = FALSE, color = "darkgreen", size = 0.5) +
+  
+  # Linear regression line
+  geom_smooth(method = "lm", se = FALSE, color = "black", linetype = "dashed", size = 0.5) +
+  
+  # Regression equation and R² annotation
+  stat_poly_eq(
+    aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")),
+    formula = y ~ x,
+    parse = TRUE,
+    label.x.npc = "left",
+    label.y.npc = 0.95,
+    size = 2.5,
+    color = "black"
+  ) +
+  
+  # Plot labels and theme
+  labs(
+    title = "Estimated Treatment Effect vs. Age",
+    x = "Age",
+    y = "Estimated Treatment Effect"
+  ) +
+  theme_minimal(base_size = 6)
+```
+
+```{r, echo = FALSE, message = FALSE, warning= FALSE, fig.width = 2, fig.height = 1.5, fig.cap="Scatterplot of the estimated CATE vs Education", include=TRUE}
+p4 <- ggplot(df_filtered, aes(x = educ, y = predictions)) +
+  # Scatter plot of data points
+  geom_point(alpha = 0.25, size = 0.1) +
+  
+  # LOESS curve for general trend
+  geom_smooth(method = "loess", se = FALSE, color = "darkred", size = 0.5) +
+  
+  # Linear regression line
+  geom_smooth(method = "lm", se = FALSE, color = "black", linetype = "dashed", size = 0.5) +
+  
+  # Regression equation and R² annotation
+  stat_poly_eq(
+    aes(label = paste(..eq.label.., ..rr.label.., sep = "~~~")),
+    formula = y ~ x,
+    parse = TRUE,
+    label.x.npc = "left",
+    label.y.npc = 0.95,
+    size = 2.5,
+    color = "black"
+  ) +
+  
+  # Plot labels and theme
+  labs(
+    title = "Estimated Treatment Effect vs. Education",
+    x = "Years of Education",
+    y = "Estimated Treatment Effect"
+  ) +
+  theme_minimal(base_size = 6)
+```
+
+```{r CATE, echo = FALSE, message = FALSE, warning= FALSE,fig.cap="Marginal distribution of the R-learner CATE estimates and how they vary conditionally with income, age, and education", include=TRUE, out.width="50%"}
+(p1 | p2) / (p3 | p4)
+```
+
+**Exercise 5**
+
+
+
+```{r Creating the C vector, echo = FALSE, eval = FALSE}
+# Initializing the pseudo-outcomes and the weights
+y_tilde <- rep(0,n)
+weights <- rep(0,n)
+
+# Create 10-fold splits
+n <- length(Y)
+folds <- createFolds(1:n, k = 10 )
+
+# Initialize containers
+c_vector <- rep(NA, n)
+
+# Loop over folds
+for (k in 1:10) {
+  train_idx <- unlist(folds[-k])
+  val_idx <- unlist(folds[k])
+  
+  # Train outcome model for treated (A=1)
+  mu1_fit <- SuperLearner(Y = Y[train_idx][A[train_idx] == 1],
+                          X = X[train_idx, ][A[train_idx] == 1, ],
+                          SL.library = sl_lib,
+                          family = gaussian())
+  mu1_hat <- predict(mu1_fit, newdata = X[val_idx, ])$pred
+  
+  "# Train outcome model for control (A=0)
+  mu0_fit <- SuperLearner(Y = Y[train_idx][A[train_idx] == 0],
+                          X = X[train_idx, ][A[train_idx] == 0, ],
+                          SL.library = sl_lib,
+                          family = gaussian())
+  mu0_hat <- predict(mu0_fit, newdata = X[val_idx, ])$pred"
+  
+  # Train propensity score model
+  e_fit <- SuperLearner(Y = A[train_idx],
+                        X = X[train_idx, ],
+                        SL.library = sl_lib,
+                        family = binomial())
+  e_hat <- predict(e_fit, newdata = X[val_idx, ])$pred
+  
+  # Compute the pseudo outcome for Y1
+  C_i <- mu1_hat  +
+    (A[val_idx] / e_hat) * (Y[val_idx] - mu1_hat) 
+  
+  c_vector[val_idx] <- C_i
+  
+}
+
+save(c_vector, file = "objects/c_vector.RData")
+```
+
+```{r Loading previously saved vector, echo = FALSE}
+load("objects/c_vector.RData")
+```
+
+<!-- Next, we compute the predictions for these pseudo-outcomes using W. -->
+
+We first compute the pseudo-outcome $C_i = \hat{Y}^1_i + \frac{A_i}{\hat{p}_i} \left( Y_i - \hat{Y}^1_i \right)$ by performing a 10-fold cross-fitting where for each selected fold we fit the propensity and the outcome models on the training 9-folds to construct the $C_i$ values on the selected one. For these models we employ the full set of covariates indicated in question 2. Then, we fit a model to predict the $C_i$ using only age, income and years of education; and perform cross-fitting in a similar manner. We denote these predictions by $\tilde{Y}_1$. Our vector of estimates of $\tilde{Y}_1$ has mean around $22k$ dollars and a range that goes from $-66k$ to $435k$, with a highly positively skewed distribution (see **Figure 5**). When we study the differences $Y - \tilde{Y}_1$ on the group of the treated, we see that it has a mean close to $0$ ($\mu=186$), but a very high volatility ($SD=66136$).
+
+```{r, echo = FALSE, eval = FALSE}
+Y1.tilde <- rep(NA, n)
+for (k in 1:10) {
+  train_idx <- unlist(folds[-k])
+  val_idx <- unlist(folds[k])
+  
+  sl_fit <- SuperLearner(Y = c_vector[train_idx],
+                         X = W[train_idx, ],
+                         SL.library = sl_lib,
+                         family = gaussian())
+  
+  Y1.tilde[val_idx] <- predict(sl_fit, newdata = W[val_idx, ])$pred
+}
+save(Y1.tilde, file = "~/Courses/CML/Project/Question_5/Y1.tilde.RData")
+```
+
+```{r, echo = FALSE}
+load("objects/Y1.tilde.RData")
+```
+
+```{r, echo = FALSE, fig.width = 4, fig.height = 2.5, warning = FALSE, fig.cap="Histogram of \\( \\tilde{Y}_1 \\)", include=TRUE, out.width="30%"}
+ggplot(data = data.frame(Y1.tilde), aes(x = Y1.tilde)) +
+  geom_histogram(aes(y = ..density..), bins = 30, fill = "skyblue", color = "white", alpha = 0.7) +
+  geom_density(color = "darkblue", size = 0.5, linetype = "dotted") +  
+  #labs(title = "Distribution of Y1.tilde", x = "Y1.tilde", y = "Density") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.32, size = 10),
+    axis.title = element_text(size = 7),
+    axis.text = element_text(size = 5),
+    panel.grid = element_blank()
+  )
+```
+
+Now we are interested in estimating the MSE for $\tilde{Y}_1$,
+$\mathbb{E} \left[ \left( Y_{1} - \tilde{Y}_1 \right)^2 \right]$, along with a 95% confidence interval. We are targeting an expression where a counterfactual appears, so we need to find an estimand that we can identify. We can draw inspiration from G-computation and use that:
+
+<!-- $$ -->
+<!-- \mathbb{E}\left[\left(Y_1 - \tilde{Y}_1(L)\right)^2\right] -->
+<!-- = \mathbb{E}_X\left[\mathbb{E}\left[\left(Y_1 - \tilde{Y}_1(L)\right)^2 \mid X\right]\right] -->
+<!-- = \mathbb{E}_X\left[\mathbb{E}\left[\left(Y_1 - \tilde{Y}_1(L)\right)^2 \mid X, A = 1\right]\right] -->
+<!-- = \mathbb{E}_X\left[\mathbb{E}\left[\left(Y - \tilde{Y}_1(L)\right)^2 \mid X, A = 1\right]\right] -->
+<!-- $$ -->
+
+<!-- where the first equality comes from the Law of Iterated Expectations, the second from conditional exchangeability (also note that $\tilde{Y}_1$ is a deterministic function of $L$ so conditioning on $A=1$ does not affect it) and the final one from consitency. This last expression is identifiable. We need to fit a new model that predicts $(Y - \tilde{Y}_1)^2$ as a function of L on the subset of the treated. Then we fit predicitons for the whole dataset and we average them. -->
+
+$\mathbb{E}\left[(Y_1 - \tilde{Y}_1(W))^2\right] = 
+\mathbb{E}_{X} \left[ 
+  \mathbb{E}\left[ (Y - \tilde{Y}_1(W))^2 \mid X, A = 1 \right] \right]$,
+
+where we rely on the conditional exchangeability and consistency assumptions (note that $\tilde{Y}_1$ is a deterministic function of $W$ and therefore of $X$). This last expression is identifiable, we just need to fit a new model that predicts $(Y - \tilde{Y}_1)^2$ as a function of $X$ on the subset of the treated. However this implies fitting another ML model to plug it in the average, which will carry plug-in bias. Another idea could be to mimic IPW derivation so as to fit:
+
+<!-- $$ -->
+<!-- \mathbb{E}\left[\left(Y_1 - \tilde{Y}_1(L)\right)^2\right]  -->
+<!-- = \mathbb{E}_X\left[\mathbb{E}\left[\left(Y_1 - \tilde{Y}_1(L)\right)^2 \mid X\right]\right]  -->
+<!-- = \mathbb{E}_X  \left[  \frac{\mathbb{E}[A \mid X]}{\mathbb{E}[A \mid X]} \cdot \mathbb{E} \left[ \left( Y_1 - \tilde{Y}_1(L) \right)^2 \mid X \right] \right]  -->
+<!-- =  \mathbb{E}_X  \left[   \mathbb{E} \left[ \frac{A \left( Y_1 - \tilde{Y}_1(L) \right)^2} {\mathbb{E}[A \mid X]} \mid X\right]  \right]  -->
+<!-- =  \mathbb{E}_X  \left[   \mathbb{E} \left[ \frac{A \left( Y - \tilde{Y}_1(L) \right)^2} {P(A=1 \mid X)} \mid X\right]  \right]  -->
+<!-- = \mathbb{E} \left[ \frac{A \left( Y - \tilde{Y}_1(L) \right)^2} {P(A=1 \mid X)} \right] -->
+<!-- $$ -->
+
+$\mathbb{E}\left[\left(Y_1 - \tilde{Y}_1(W)\right)^2\right] = 
+\mathbb{E}_X  \left[  \frac{\mathbb{E}[A \mid X]}{\mathbb{E}[A \mid X]} \cdot \mathbb{E} \left[ \left( Y_1 - \tilde{Y}_1(W) \right)^2 \mid X \right] \right]
+= \mathbb{E} \left[ \frac{A \left( Y - \tilde{Y}_1(W) \right)^2} {P(A=1 \mid X)} \right]$, 
+
+where we add positivity to the assumptions. We saw previously that while we did not have extreme cases, we did have several cases of weights over 10 and getting even to 20, which will affect the quality of the IPW estimate. This would suggest choosing a doubly-robust estimator like the AIPW or the TMLE. We opt for the first. Note that this will follow the same procedure of estimating the average of a counterfactual $E[Z_{1}]$ but where the outcome variable $Z$ is the vector of squared differences $SD=(Y - \tilde{Y}_{1})^2$. 
+
+Then our estimator becomes:
+
+$\displaystyle \hat{\psi}_{\text{AIPW}} = \frac{1}{n} \displaystyle\sum_{i=1}^n \left[
+  \frac{A_i}{\widehat{\mathbb{P}}(A_i = 1 \mid X_i)} \left((Y_i - \tilde{Y}_1(W_i))^2 - \widehat{\mathbb{E}}\left[(Y_i - \tilde{Y}_1(W_i))^2 \mid X_i, A_i = 1\right]\right)
+  + \widehat{\mathbb{E}}\left[(Y_i - \tilde{Y}_1(W_i))^2 \mid X_i, A_i = 1\right]
+\right]$.
+
+We fit an AIPW estimator with 10-fold crossfitting as usual. The propensity score remains the same as in previous questions, but since $SD$ is non-negative, we change the approach for the outcome model in that we take the logarithm as outcome for the initial modelling with the SuperLearner and then obtain our predictions by taking the exponential. Also, note that while we want to estimate the MSE of $\tilde{Y}_1$, which is a function of W, we should use all the control variables to fit both the propensity score model and the outcome regression model to meet the conditional ignorability condition.
+
+```{r, echo = FALSE, eval = FALSE}
+SD <- (Y - Y1.tilde)**2 # Define the squared difference variabel for the whole population
+lSD <- log(SD) # I will predict the logarithm of the SD to later apply exp so I make sure the SD hats are positive 
+
+# Storage for nuisance predictions
+SD_hat <- rep(NA, n)
+e_hat   <- rep(NA, n)
+
+# Loop over folds
+for (k in 1:10) {
+  train_idx <- unlist(folds[-k])
+  val_idx   <- unlist(folds[k])
+  
+  # Fit outcome model for A = 1
+  lSD_fit <- SuperLearner(Y = lSD[train_idx][A[train_idx] == 1],
+                          X = X[train_idx, ][A[train_idx] == 1, ],
+                          SL.library = sl_lib,
+                          family = gaussian())
+  SD_hat[val_idx] <- exp(predict(lSD_fit, newdata = X[val_idx, ])$pred)
+  
+  # Fit propensity score model
+  e_fit <- SuperLearner(Y = A[train_idx],
+                        X = X[train_idx, ],
+                        SL.library = sl_lib,
+                        family = binomial())
+  e_hat[val_idx] <- predict(e_fit, newdata = X[val_idx, ])$pred
+}
+
+save(SD_hat, file = "~/Courses/CML/Project/Question_5/SD_hat.RData")
+save(e_hat, file = "~/Courses/CML/Project/Question_5/e_hat.RData")
+
+# Compute AIPW estimate
+aipw_scores <- SD_hat + (A / e_hat) * (SD - SD_hat)
+SD_estimate <- mean(aipw_scores)
+SD_se <- sd(aipw_scores) / sqrt(n)
+
+save(SD_estimate, file = "~/Courses/CML/Project/Question_5/SD_estimate.RData")
+save(SD_se, file = "~/Courses/CML/Project/Question_5/SD_se.RData")
+```
+
+
+```{r, echo = FALSE}
+# Results
+load( file = "objects/SD_estimate.RData")
+load(file = "objects/SD_se.RData")
+```
+
+```{r, echo = FALSE, include=TRUE}
+# Create CI
+ci <- SD_estimate + c(-1.96, 1.96) * SD_se
+
+# Create table
+results <- data.frame(
+  Estimate = round(SD_estimate, 4),
+  `Std. Error` = round(SD_se, 4),
+  `CI_Lower` = round(ci[1], 4),
+  `CI_Upper` = round(ci[2], 4)
+)
+
+# Set clean LaTeX column names with escaped percent signs
+colnames(results) <- c(
+  "Estimate",
+  "Std. Error",
+  "CI_Lower",
+  "CI_Upper"
+)
+
+# Render the table
+kable(results, format = "latex", booktabs = TRUE,
+      caption = "AIPW Estimate of MSE for $\\tilde{Y}_1$ with $95\\%$ CI") %>%
+  kable_styling(latex_options = "hold_position")
+```
+
+The high value of the estimate is due to the very high volatility of both $Y$ and the estimates $\tilde{Y}_{1}$. Even if we saw evidence pointing that our pseudo-outcomes are close to being unbiased, the existence of extreme values in $Y_{1}$, added to the error dragged by the multiple models that we fitted and the low number of variables that we used to compute $\tilde{Y}_{1}$, explain the sometimes extreme values of the vector of differences (even when restricting to the treated group). By taking the square we exacerbate these extreme values, which leads to our high MSE estimate.
+
+\newpage 
+Regarding the division of work, Michelina Pizzocaro completed Exercises 2 and 3, while Carlos Rodriguez Ameal completed Exercises 4 and 5. Exercise 1 was done jointly by both students. Each report section was written by the student who completed the corresponding exercises.
+
+
+
+

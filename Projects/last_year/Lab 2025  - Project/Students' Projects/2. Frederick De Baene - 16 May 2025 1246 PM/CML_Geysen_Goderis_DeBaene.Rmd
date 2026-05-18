@@ -1,0 +1,556 @@
+---
+title: "Causal Machine Learning: Project"
+author: "Frederick De Baene, Jonas Geysen, Antoon Goderis"
+output: pdf
+---
+
+# Setup
+
+```{r}
+library(hdm)
+library(SuperLearner)
+library(tmle)
+library(dplyr)
+library(flextable)
+library(ggplot2)
+# library(rlearner)
+library(grf)
+```
+
+```{r}
+# Load data
+data(pension)
+```
+
+```{r}
+sl_lib <- list("SL.glm", "SL.step", "SL.glm.interaction", "SL.randomForest")
+```
+
+# Question 2
+
+```{r}
+# There are 9915 observations in total
+n <- nrow(pension)
+
+# The outcome of interest are the accumulated net financial assets
+Y <- pension$net_tfa
+  
+# The exposure of interest is eligibility for a 401(k)
+A <- pension$e401
+
+# The covariates include the following
+covariates <- c(
+  "age",
+  "inc",
+  "fsize",
+  "educ",
+  "marr",
+  "twoearn",
+  "db",
+  "pira",
+  "hown"
+)
+X <- pension[, covariates, drop = FALSE]
+```
+
+We start by estimating the propensity scores non-parametrically using
+SuperLearner. We apply 10-fold cross-fitting.
+
+```{r}
+set.seed(123)
+
+# We apply 10-fold cross-fitting
+K <- 5
+fold_indices <- sample(rep(x = 1:K, times = ceiling(n / K))[1:n])
+
+# Obtain propensity scores
+mu_hat <- tibble(
+  "mu" = rep(NA, times = n),
+  "mu0" = rep(NA, times = n),
+  "mu1" = rep(NA, times = n),
+)
+est_prop_scores <- rep(NA, n)
+
+for (k in 1:K) {
+
+  print(paste0("Iteration : ", k))
+  train <- fold_indices != k
+  test <- fold_indices == k
+  
+  if (K == 1)
+    train <- test
+  
+  # Use SuperLearner to obtain propensity scores
+  print("Estimating propensity scores ...")
+  model <- SuperLearner(
+    A[train],
+    X[train,],
+    newX = X[test,],
+    family = binomial(link = "logit"),
+    SL.library = sl_lib
+  )
+  est_prop_scores[test] <- model$SL.predict
+  
+  # Use SuperLearner to obtain estimated outcomes
+  print("Estimating outcomes in non-exposed ...")
+  model0 <- SuperLearner(
+    Y[(A == 0) & train],
+    X[(A == 0) & train,],
+    newX = X[test,],
+    family = "gaussian",
+    SL.library = sl_lib
+  )
+  mu_hat[test, "mu0"] <- model0$SL.predict
+  
+  print("Estimating outcomes in exposed ...")
+  model1 <- SuperLearner(
+    Y[(A == 1) & train],
+    X[(A == 1) & train,],
+    newX = X[test,],
+    family = "gaussian",
+    SL.library = sl_lib
+  )
+  mu_hat[test, "mu1"] <- model1$SL.predict
+  
+}
+
+mu_hat <- dplyr::mutate(mu_hat, mu = A*mu1 + (1 - A)*mu0)
+```
+
+```{r}
+saveRDS(est_prop_scores, file = "est_prop_scores_ATE_K_5.rds")
+saveRDS(mu_hat, file = "mu_hat_ATE_K_5.rds")
+```
+
+```{r}
+est_prop_scores <- readRDS("est_prop_scores_ATE_K_5.rds")
+mu_hat <- readRDS("mu_hat_ATE_K_5.rds")
+```
+
+```{r}
+# Obtain the estimated probability of exposure and non-exposure given the 
+# confounders
+G1_aipw <- est_prop_scores
+G0_aipw <- 1 - est_prop_scores
+
+# Obtain the estimated outcome given exposure and non-exposure
+Q_aipw <- mu_hat$mu
+Q1_aipw <- mu_hat$mu1
+Q0_aipw <- mu_hat$mu0
+```
+
+We calculate the estimate.
+
+```{r}
+ate_aipw <- mean(((A / G1_aipw) - ((1 - A) / G0_aipw)) * (Y - Q_aipw) + Q1_aipw - Q0_aipw)
+ate_aipw
+```
+
+To calculate the standard error, we apply the efficient influence curve to
+every observation. The standard error is calculated using the standard deviation
+of these values.
+
+```{r}
+ate_IF <- (A / G1_aipw - (1 - A) / G0_aipw) * (Y - Q_aipw) + Q1_aipw - Q0_aipw - ate_aipw
+ate_aipw_se <- sd(ate_IF) / sqrt(n)
+ate_aipw_se
+```
+
+We can also construct a confidence interval:
+
+```{r}
+ll <- ate_aipw - 1.96 * ate_aipw_se; ll
+ul <- ate_aipw + 1.96 * ate_aipw_se; ul
+```
+
+```{r}
+att_aipw_num <- sum(((A / mean(A)) * (Y - Q0_aipw)) - ((1 - A) / (G0_aipw)) * ((G1_aipw) / (mean(A))) * (Y - Q0_aipw))
+att_aipw_den <- sum(A / mean(A))
+att_aipw <- att_aipw_num / att_aipw_den
+att_aipw
+```
+
+```{r}
+att_IF <- (A / mean(A)) * (Y - Q0_aipw - att_aipw) - ((1 - A) / (G0_aipw)) * ((G1_aipw) / (mean(A))) * (Y - Q0_aipw)
+att_aipw_se <- sd(att_IF) / sqrt(n)
+att_aipw_se
+```
+
+```{r}
+ll <- att_aipw - 1.96 * att_aipw_se; ll
+ul <- att_aipw + 1.96 * att_aipw_se; ul
+```
+
+We also check the positivity assumption.
+
+```{r}
+# Check positivity assumption (c)
+Apihat <- as.data.frame(cbind(A, est_prop_scores))
+
+pi_A1 <- Apihat$est_prop_scores[Apihat$A == 1]
+pi_A0 <- Apihat$est_prop_scores[Apihat$A == 0]
+
+pi_A1_inverse <- (1/Apihat$est_prop_scores[Apihat$A == 1])
+pi_A0_inverse <- (1/Apihat$est_prop_scores[Apihat$A == 0])
+```
+
+```{r}
+png(filename="/home/rstudio/Project/imgs/prop_scores_dens.png")
+plot(
+  density(pi_A1, na.rm = TRUE),
+  col = "red",
+  lwd = 2, 
+  main = "Density for Propensity Scores",
+  xlab = "Propensity score",
+  ylim = c(0, max(density(pi_A1)$y, density(pi_A0)$y))
+)
+lines(density(pi_A0, na.rm = TRUE), col = "blue", lwd = 2)
+legend(
+  "topright",
+  legend = c("A = 1", "A = 0"),
+  col = c("red", "blue"),
+  lwd = 2,
+)
+dev.off()
+```
+
+```{r}
+# Create a box plot with the propensity scores
+png(filename="/home/rstudio/Project/imgs/prop_scores_boxp.png")
+boxplot(
+  pi_A1_inverse,
+  pi_A0_inverse, 
+  names = c("A = 1", "A = 0"), 
+  col = c("red", "blue"), 
+  main = "Distribution of Weights (Inverse of Propensity Scores)", 
+  ylab = "1/pi_hat_nonpar_bounded"
+)
+dev.off()
+```
+
+```{r}
+g <- est_prop_scores
+Q <- mu_hat
+names(Q) <- c("Q", "Q0", "Q1")
+```
+
+```{r}
+N <- n
+H1 <- A / g
+H0 <- (1 - A) / (1 - g)
+
+# Estimate parameters delta in the fluctuation model and target the predictions
+Q.tmle <- as_tibble(matrix(0, nrow = N, ncol = 2,
+                           dimnames = list(c(), c("Q0.tmle", "Q1.tmle"))))
+
+delta1.tmle <- coef(lm(Y ~ -1 + offset(Q$Q1) + H1))
+Q.tmle["Q1.tmle"] <- Q$Q1 + delta1.tmle * H1
+
+delta0.tmle <- coef(lm(Y ~ -1 + offset(Q$Q0) + H0))
+Q.tmle["Q0.tmle"] <- Q$Q0 + delta0.tmle * H0
+
+# Compute E[Y^1] and E[Y^0]
+EY1.tmle <- mean(Q.tmle$Q1.tmle)
+EY0.tmle <- mean(Q.tmle$Q0.tmle)
+ATE.tmle <- EY1.tmle - EY0.tmle
+
+# Compute standard errors of E[Y^1] and E[Y^0] using the efficient influence curves
+EIC.EY1.tmle <- (A / g) * (Y - Q.tmle$Q1.tmle) + Q.tmle$Q1.tmle - EY1.tmle
+EIC.EY0.tmle <- ((1 - A) / (1 - g)) * (Y - Q.tmle$Q0.tmle) + Q.tmle$Q0.tmle - EY0.tmle
+
+se.EY1.tmle <- (1 / sqrt(N)) * sd(EIC.EY1.tmle)
+se.EY0.tmle <- (1 / sqrt(N)) * sd(EIC.EY0.tmle)
+se.ATE.tmle <- (1 / sqrt(N)) * sd(EIC.EY1.tmle - EIC.EY0.tmle)
+
+# Compute the confidence intervals for E[Y^1] and E[Y^0]
+EY1.tmle.CI.low <- EY1.tmle - 1.96 * se.EY1.tmle
+EY1.tmle.CI.high <- EY1.tmle + 1.96 * se.EY1.tmle
+
+EY0.tmle.CI.low <- EY0.tmle - 1.96 * se.EY0.tmle
+EY0.tmle.CI.high <- EY0.tmle + 1.96 * se.EY0.tmle
+
+ATE.tmle.CI.low <- ATE.tmle - 1.96 * se.ATE.tmle
+ATE.tmle.CI.high <- ATE.tmle + 1.96 * se.ATE.tmle
+
+# Print the results
+print(ATE.tmle)
+print(ATE.tmle.CI.low)
+print(ATE.tmle.CI.high)
+```
+
+For the ATT.
+
+```{r}
+P_A1 <- mean(A)
+g <- G1_aipw
+g <- pmin(g, 0.99)
+g <- pmax(g, 0.01)
+
+# Construct clever covariate H
+H <- ifelse(A == 1, 1 / P_A1, -g / (P_A1 * (1 - g)))
+
+# Fit fluctuation model (update Q0 to Q0_star)
+epsilon_model <- glm(Y ~ -1 + H + offset(Q0_aipw), family = gaussian)
+epsilon <- coef(epsilon_model)["H"]
+Q0_tmle <- Q0_aipw + epsilon * H
+
+# Compute ATT
+theta_hat <- mean( (Y[A == 1] - Q0_tmle[A == 1]) )
+
+# Influence function and standard error
+IF_part1 <- (A / P_A1) * (Y - Q0_tmle - theta_hat)
+IF_part2 <- ((1 - A) * g / (P_A1 * (1 - g))) * (Y - Q0_tmle)
+IF <- IF_part1 - IF_part2
+se <- sqrt(mean(IF^2)) / sqrt(n)
+```
+
+```{r}
+theta_hat
+```
+
+```{r}
+# Confidence interval
+ci <- theta_hat + c(-1.96, 1.96) * se
+ci
+```
+
+Calculate the ATT without covariate adjustment:
+
+```{r}
+Y_0 <- Y[A == 0]
+Y_1 <- Y[A == 1]
+
+ATT_wo_cov_adj <- mean(Y_1) - mean(Y_0)
+ATT_wo_cov_adj
+```
+
+# Question 3
+
+We estimate $\theta$ as follows:
+
+```{r}
+est_theta <- mean((A - est_prop_scores) * (Y - mu_hat$mu))
+est_theta
+```
+
+We calculate the efficient influence curve for every observation:
+
+```{r}
+IF_theta <- (A - est_prop_scores) * (Y - mu_hat$mu) - est_theta
+est_theta_se <- sd(IF_theta) / sqrt(n)
+est_theta_se
+```
+
+To obtain a p-value:
+
+```{r}
+(1 - pnorm(q = est_theta, mean = 0, sd = est_theta_se)) * 2
+```
+
+# Question 4
+
+```{r}
+set.seed(123)
+
+################################################################################
+# 1. Create K folds
+n <- nrow(pension)
+folds <- sample(rep(1:5, length.out = n))
+
+# 2. Initialize a matrix for CATEs
+cate_estimates <- rep(NA, nrow(X))
+
+# 3. Loop over folds
+for (i in 1:5) {
+  train_idx <- which(folds != i)
+  test_idx  <- which(folds == i)
+  
+  # Fit causal forest on training data
+  cf_model <- causal_forest(X[train_idx, ], 
+                            Y[train_idx], 
+                            A[train_idx],
+                            tune.parameters = c("sample.fraction", 
+                                                "mtry", 
+                                                "min.node.size"))
+  
+  # Predict on the test fold
+  cate_estimates[test_idx] <- predict(cf_model, X[test_idx, ])$predictions
+}
+
+################################################################################
+# histogram
+hist(cate_estimates,
+     breaks = 30,
+     main = "Histogram of Estimated CATEs",
+     xlab = "Estimated Treatment Effect",
+     col = "lightblue",
+     border = "black")
+mean(cate_estimates)
+summary(cate_estimates)
+
+################################################################################
+results <- data.frame(tau = cate_estimates, age = X$age, inc = X$inc, educ = X$educ)
+
+# By age
+ggplot(results, aes(x = age, y = tau)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess") +
+  labs(title = "CATE vs Age", x = "Age", y = "Estimated Treatment Effect") +
+  theme_classic()
+
+# By income
+ggplot(results, aes(x = inc, y = tau)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess") +
+  labs(title = "CATE vs Income", x = "Income", y = "Estimated Treatment Effect") +
+  theme_classic()
+
+# By education
+ggplot(results, aes(x = educ, y = tau)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "loess") +
+  labs(title = "CATE vs Education", x = "Years of Education", y = "Estimated Treatment Effect") +
+  theme_classic()
+```
+
+# Question 5
+
+```{r}
+df <- pension
+
+# Full covariate set (controls) used for nuisance estimation:
+#X_full <- df[, c("age", "inc", "educ", "fsize", "marr", "twoearn", "db", "ira", "hown")]
+X_full <- df[, c("age", "inc", "educ", "fsize", "marr", "twoearn", "db", "pira", "hown")]
+
+# Reduced set for prediction (e.g., for visualizing heterogeneity or estimating the counterfactual outcome)
+X_reduced <- df[, c("age", "inc", "educ")]
+
+n <- nrow(X_full)
+K <- 5
+
+sl_lib <- c("SL.glm", "SL.randomForest", "SL.xgboost")
+
+# Create folds for cross-fitting
+folds <- sample(rep(1:K, length.out = n))
+Y1_hat <- rep(NA, n)
+p_hat <- rep(NA, n)
+
+# STEP 2: Estimate Nuisance Functions with Cross-Fitting Using Full Covariates
+for (k in 1:K) {
+  train_idx <- which(folds != k)
+  test_idx  <- which(folds == k)
+  
+  # Outcome model for treated subjects (to estimate Y1 for those with A == 1)
+  mu1_fit <- SuperLearner(
+    Y = Y[train_idx][A[train_idx] == 1],
+    X = X_full[train_idx, ][A[train_idx] == 1, ],
+    newX = X_full[test_idx, ],
+    SL.library = sl_lib,
+    family = gaussian()
+  )
+  Y1_hat[test_idx] <- mu1_fit$SL.predict
+  
+  # Propensity score estimation using full covariates
+  ps_fit <- SuperLearner(
+    Y = A[train_idx],
+    X = X_full[train_idx, ],
+    newX = X_full[test_idx, ],
+    SL.library = sl_lib,
+    family = binomial()
+  )
+  p_hat[test_idx] <- ps_fit$SL.predict
+}
+
+# (Optionally, examine the propensity score distribution)
+summary(p_hat)
+hist(p_hat, breaks = seq(0, 1, by=0.1), main = "Histogram of Propensity Scores")
+axis(1, at = seq(0, 1, by=0.1))
+
+# STEP 3: Construct the DR Pseudo-outcome
+#   C = Y1_hat + (A / p_hat) * (Y - Y1_hat)
+C <- Y1_hat + (A / p_hat) * (Y - Y1_hat)
+summary(C)
+
+# STEP 4: Fit the DR-Learner Model to Predict the Pseudo-outcome Using Only Reduced Covariates
+dr_model <- SuperLearner(
+  Y = C,
+  X = X_reduced,    # Here, we use only age, inc, and educ as predictors
+  newX = X_reduced,
+  SL.library = sl_lib,
+  family = gaussian()
+)
+Y1_tilde <- dr_model$SL.predict
+
+# Check the distribution of the DR-learner predictions
+hist(Y1_tilde, breaks = 40, col = "darkorange",
+     main = "Histogram of DR-Learner Predictions (Counterfactual Y1)",
+     xlab = "Predicted Counterfactual Outcome (Y1_tilde)")
+summary(Y1_tilde)
+
+# STEP 5: Evaluate the Counterfactual Prediction Error
+# We use IPW weights for all subjects. 
+weights_raw <- A / p_hat + (1 - A) / (1 - p_hat)
+summary(weights_raw)
+sd(weights_raw)
+# IMPORTANT: Compute error using the pseudo-outcome C rather than the observed Y,
+# because C represents our counterfactual target (Y1) through DR correction.
+errors_raw <- weights_raw * (C - Y1_tilde)^2
+error_est_raw <- mean(errors_raw)
+se_raw <- sd(errors_raw) / sqrt(n)
+ci_raw <- c(error_est_raw - 1.96 * se_raw, error_est_raw + 1.96 * se_raw)
+
+# STEP 6: Output the Counterfactual Prediction Error Results
+cat(sprintf("Counterfactual Prediction Error = %.2f\n95%% CI = [%.2f, %.2f]\n",
+            error_est_raw, ci_raw[1], ci_raw[2]))
+
+# Top 5 errors
+
+# Step 1: Construct a data frame from the existing vectors.
+df_errors <- data.frame(
+  A = A,
+  Y = Y,
+  Y1_tilde = Y1_tilde,
+  error = errors_raw
+)
+
+# Step 2: Compute the total error over all observations.
+total_error <- sum(df_errors$error)
+
+# Step 3: Identify the top 5 observations with the largest prediction error 
+# and compute each observation's error contribution (in percentage).
+top5_errors <- df_errors %>%
+  arrange(desc(error)) %>%
+  slice_head(n = 5) %>%
+  mutate(Error_pct = (error / total_error) * 100)
+
+# Step 4: Create a new data frame selecting only the relevant columns and format numbers.
+df_display <- top5_errors %>%
+  select(A, Y, Y1_tilde, error, Error_pct) %>%
+  mutate(
+    Y = ifelse(abs(as.numeric(Y)) >= 1e6,
+               formatC(as.numeric(Y), format = "f", digits = 2, big.mark = ","),
+               formatC(as.numeric(Y), format = "f", digits = 2)),
+    Y1_tilde = ifelse(abs(as.numeric(Y1_tilde)) >= 1e6,
+                      formatC(as.numeric(Y1_tilde), format = "f", digits = 2, big.mark = ","),
+                      formatC(as.numeric(Y1_tilde), format = "f", digits = 2)),
+    error = ifelse(abs(as.numeric(error)) >= 1e6,
+                   formatC(as.numeric(error), format = "f", digits = 2, big.mark = ","),
+                   formatC(as.numeric(error), format = "f", digits = 2)),
+    Error_pct = formatC(Error_pct, format = "f", digits = 2)
+  )
+
+# Step 5: Create and display the flextable.
+ft_top5 <- flextable(df_display) %>%
+  set_header_labels(
+    A = "Treatment (A)",
+    Y = "Observed Outcome (Y)",
+    Y1_tilde = "Predicted Counterfactual (Y1_tilde)",
+    error = "Prediction Error",
+    Error_pct = "Error Contribution (%)"
+  ) %>%
+  autofit() %>%
+  set_caption("Top 5 Observations with Largest Prediction Error and Their Error Contribution")
+
+print(ft_top5)
+```
+

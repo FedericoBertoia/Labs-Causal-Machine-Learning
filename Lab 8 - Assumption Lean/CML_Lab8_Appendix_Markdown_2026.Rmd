@@ -1,0 +1,299 @@
+---
+title: "Lab 8: Assumption-Lean Regression (Appendix)"
+subtitle: "Causal Machine Learning"
+author: "Federico Bertoia, Ghent University"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+### A.1 Motivation
+
+Consider a continuous exposure $A$ and a high dimensional covariate $L$ that is sufficient to adjust for confounding of the effect of $A$ on $Y$. We will focus on learning the (conditional) average treatment effect (CATE) of shifting the observed exposure $A$ in each individual additively with $a$ units to deliver exposure level $A + a$
+$$
+E\big[Y^{A+a} - Y \mid A,L \big],
+$$
+which is identified under standard causal assumptions such as conditional exchangeability, positivity and consistency.
+Since effects are sometimes more simply parameterized on other scales, we will more generally focus on generalized conditional average treatment effects by modeling contrasts
+$$
+g\big\{E\big[Y^{A+a} \mid A, L \big]\big\} - g\big\{E\big[Y \mid A, L \big]\big\} = h(a,A,L),
+$$
+where $g(\cdot)$ is a user-specified link function (e.g., identity, logit or log).
+In practice we do not know $h(a,A,L)$, and we approximate it using parametric model. For instance, we can choose the approximation
+$$
+h(a,A,L) = \beta a
+$$
+such that we recover the generalized partially linear model
+$$
+g\{E[Y \mid A, L]\} = \alpha(L) + \beta A ,
+$$
+Given this choice for the approximation, we can predict the outcome under the shift intervention as
+$$
+g\{E[Y \mid A+a, L]\} = g\{E[Y \mid A, L]\} + \beta a
+$$
+We do not want to make any modeling assumption, thus we define $\beta$ as the minimizer of a population risk function that quantifies (squared) approximation bias in the causal effect:
+$$
+\mathcal{L}(\beta)=E\left\{\int\left(g\{E[Y \mid A+a, L]\}-g\{E(Y \mid A, L)\}-\beta a\right)^2 f(A+a \mid L) d a\right\}
+$$
+As shown in Appendix A.3, $\beta$ is equivalently defined by the estimand:
+$$
+\beta = \frac{E\{\text{Cov}(A, g\{E[Y \mid A, L]\} \mid L)\}}{E\{\text{Var}(A \mid L)\}}
+$$
+The **efficient influence function** of $\beta$ is:
+
+$$
+\Phi(\beta) = \frac{\{A - E(A \mid L)\}\bigl[\mu(Y,A,L)- \beta\{A - E(A \mid L)\}\bigr]}{E\bigl[\{A - E(A \mid L)\}^2\bigr]},
+$$
+where $\mu(Y,A,L) = g'\{E[Y \mid A,L]\} (Y - E[Y \mid A,L]) + g\{E[Y \mid A,L]\} - E\big[g\{E[Y \mid A,L]\} \mid L\big]$.
+
+A debiased estimate for $\beta$ is obtained (by setting the efficient influence function to zero and solving for $\beta$) as:
+
+$$
+\hat{\beta} = \frac{\sum_{i=1}^n \bigl\{A_i - \hat{E}(A_i \mid L_i)\bigr\}\hat{\mu}(Y,A,L)}{\sum_{i=1}^n \bigl\{A_i - \hat{E}(A_i \mid L_i)\bigr\}^2}.
+$$
+
+In practice this corresponds to linearly regressing the pseudo outcome $\hat{\mu}(Y,A,L)$
+onto $(A - \hat{\pi})$ with no intercept, using a sandwich (robust)
+standard error. Cross-fitting is recommended to avoid overfitting bias.
+
+---
+
+### A.2 Estimation Procedures
+
+All three procedures share the same first two steps: predict the exposure $A$ from $L$ to obtain $\hat{p} = \hat{E}(A \mid L)$, and predict the outcome $Y$ from $(A, L)$ to obtain $\hat{Y} = \hat{E}(Y \mid A, L)$. They differ in how the pseudo-outcome is constructed and which link function is used.
+
+**A.2.1 Linear (Risk Difference)**
+
+Working model: $E(Y^a \mid L) = \alpha(L) + \beta a$.
+
+1. Predict $A$ from $L$: obtain $\hat{p} = \hat{E}(A \mid L)$.
+2. Predict $Y$ from $L$: obtain $\hat{Y} = \hat{E}(Y \mid L)$.
+3. Regress $Y - \hat{Y}$ onto $A - \hat{p}$ with no intercept using a sandwich standard error.
+
+The pseudo-outcome is $\tilde{Y}^{\text{lin}} = Y - \hat{Y}$, and the slope identifies $\beta$ as the risk difference per unit increase in $A$.
+
+**A.2.2 Log-linear (Risk Ratio)**
+
+Working model: $\log E(Y^a \mid L) = \alpha(L) + \beta a$, so that $\text{RR} = e^\beta$.
+
+1. Predict $A$ from $L$: obtain $\hat{p} = \hat{E}(A \mid L)$.
+2. Predict $Y$ from $(A, L)$: obtain $\hat{Y} = \hat{E}(Y \mid A, L)$.
+3. Predict $\log \hat{Y}$ from $L$: obtain $\hat{q}^{\log} = \hat{E}[\log \hat{Y} \mid L]$.
+4. Construct the pseudo-outcome
+$$
+\tilde{Y}^{\log} = \log(\hat{Y}) - \hat{q}^{\log} + \frac{Y - \hat{Y}}{\hat{Y}}.
+$$
+5. Regress $\tilde{Y}^{\log}$ onto $A - \hat{p}$ with no intercept using a sandwich standard error.
+
+The slope $\hat\beta$ is on the log scale; the risk ratio estimate is $e^{\hat\beta}$ with confidence interval $\bigl(e^{\hat\beta - 1.96\,\widehat{\text{SE}}},\, e^{\hat\beta + 1.96\,\widehat{\text{SE}}}\bigr)$.
+
+**A.2.3 Logistic (Odds Ratio)**
+
+Working model: $\text{logit}\, E(Y^a \mid L) = \alpha(L) + \beta a$, so that $\text{OR} = e^\beta$.
+
+1. Predict $A$ from $L$: obtain $\hat{p} = \hat{E}(A \mid L)$.
+2. Predict $Y$ from $(A, L)$: obtain $\hat{Y} = \hat{E}(Y \mid A, L)$.
+3. Predict $\text{logit}\,\hat{Y}$ from $L$: obtain $\hat{q}^{\text{logit}} = \hat{E}[\text{logit}\,\hat{Y} \mid L]$.
+4. Construct the pseudo-outcome
+$$
+\tilde{Y}^{\text{logit}} = \text{logit}(\hat{Y}) - \hat{q}^{\text{logit}} + \frac{Y - \hat{Y}}{\hat{Y}(1-\hat{Y})}.
+$$
+5. Regress $\tilde{Y}^{\text{logit}}$ onto $A - \hat{p}$ with no intercept using a sandwich standard error.
+
+The slope $\hat\beta$ is on the log-odds scale; the odds ratio estimate is $e^{\hat\beta}$.
+
+
+---
+
+### A.3 From Minimizer to Estimand
+
+We derive the closed-form expression for $\beta$ starting from the population risk:
+
+$$
+\mathcal{L}(\beta) = E\left[\int \left(g\{E[Y \mid A+a, L]\} - g\{E[Y \mid A, L]\} - \beta a \right)^2 f(A+a \mid L)\, da\right].
+$$
+
+Taking the derivative with respect to $\beta$ and setting it to zero:
+
+$$
+\frac{\partial \mathcal{L}(\beta)}{\partial \beta} = E\left[\int -2a\left[\Delta_g(A,a,L) - \beta a\right] f(A+a \mid L)\, da\right] = 0,
+$$
+
+where $\Delta_g(A,a,L) := g\{E(Y \mid A+a, L)\} - g\{E(Y \mid A, L)\}$. Rearranging:
+
+$$
+\beta = \frac{E\left[\int a \cdot \Delta_g(A,a,L) \cdot f(A+a \mid L)\, da\right]}{E\left[\int a^2\, f(A+a \mid L)\, da\right]}
+$$
+
+**Numerator.** Substitute $A^* = A + a$, so that $A^* \mid L \stackrel{d}{=} A \mid L$ and $A^*$ is independent of $A$ given $L$:
+
+$$
+\begin{aligned}
+\text{Num}
+&= E\left[\int (A^* - A)\Bigl(g\{E(Y \mid A^*, L)\} - g\{E(Y \mid A, L)\}\Bigr) f(A^* \mid L)\, dA^*\right]\\
+&= E\!\left[E\!\left[(A^* - A)\, g\{E(Y \mid A^*, L)\} \mid L\right]\right]
+ - E\!\left[E\!\left[(A^* - A)\, g\{E(Y \mid A, L)\} \mid L\right]\right].
+\end{aligned}
+$$
+
+For the first term, using independence of $A^*$ and $A$ given $L$, and $A^* \stackrel{d}{=} A \mid L$:
+
+$$
+E\!\left[E\!\left[(A^* - A)\, g\{E(Y \mid A^*, L)\} \mid L\right]\right]
+= E\!\left[\operatorname{Cov}\!\left(A,\, g\{E(Y \mid A, L)\} \mid L\right)\right].
+$$
+
+By the same reasoning the second term yields the same quantity, so:
+
+$$
+\text{Num} = 2\, E\!\left[\operatorname{Cov}\!\left(A,\, g\{E(Y \mid A, L)\} \mid L\right)\right].
+$$
+
+**Denominator.** Using $A^* \stackrel{d}{=} A \mid L$ and independence of $A^*$ and $A$ given $L$:
+
+$$
+\begin{aligned}
+\text{Den}
+&= E\!\left[E\!\left[(A^* - A)^2 \mid L\right]\right]\\
+&= E\!\left[E[A^{*2} \mid L] + E[A^2 \mid L] - 2\,E[A^* \mid L]\,E[A \mid L]\right]\\
+&= E\!\left[2\,E[A^2 \mid L] - 2\,(E[A \mid L])^2\right]\\
+&= 2\, E\!\left[\operatorname{Var}(A \mid L)\right].
+\end{aligned}
+$$
+
+**Conclusion.**
+
+$$
+\beta = \frac{E\!\left[\operatorname{Cov}\!\left(A,\, g\{E(Y \mid A, L)\} \mid L\right)\right]}{E\!\left[\operatorname{Var}(A \mid L)\right]}.
+$$
+
+---
+
+### A.4 General Estimand Reduces to Overlap-Weighted ATE for Binary $A$
+
+We show that when $A \in \{0,1\}$:
+
+$$
+\frac{E\{\operatorname{Cov}(A, Y \mid L)\}}{E\{\operatorname{Var}(A \mid L)\}} = \frac{E\{w(L)\,\beta(L)\}}{E\{w(L)\}},
+$$
+
+with $\beta(L) = E(Y \mid A=1, L) - E(Y \mid A=0, L)$ and $w(L) = P(A=1\mid L)\,P(A=0\mid L)$.
+
+**Key observation.** For binary $A$, $\operatorname{Var}(A \mid L) = P(A=1\mid L)\,P(A=0\mid L) = w(L)$, so the denominator is already $E\{w(L)\}$.
+
+**Numerator.** Let $p = p(L) = P(A=1\mid L)$, $\mu_1 = E(Y \mid A=1, L)$, $\mu_0 = E(Y \mid A=0, L)$. Then:
+
+$$
+E[AY \mid L] = \mu_1\, p, \quad E[A \mid L] = p, \quad E[Y \mid L] = \mu_1\, p + \mu_0\,(1-p).
+$$
+
+So:
+
+$$
+\begin{aligned}
+\operatorname{Cov}(A, Y \mid L)
+&= E[AY \mid L] - E[A\mid L]\,E[Y\mid L]\\
+&= \mu_1 p - p\bigl(\mu_1 p + \mu_0(1-p)\bigr)\\
+&= p\bigl(\mu_1(1-p) - \mu_0(1-p)\bigr)\\
+&= p\,(1-p)\,\beta(L)\\
+&= \beta(L)\,\operatorname{Var}(A\mid L).
+\end{aligned}
+$$
+
+Therefore $E\{\operatorname{Cov}(A,Y\mid L)\} = E\{w(L)\,\beta(L)\}$, which gives:
+
+$$
+\frac{E\{\operatorname{Cov}(A,Y\mid L)\}}{E\{\operatorname{Var}(A\mid L)\}} = \frac{E\{w(L)\,\beta(L)\}}{E\{w(L)\}}.
+$$
+
+---
+
+### A.5 Debiased Estimator for Overlap-Weighted Baseline Characteristics
+
+The overlap-weighted mean of a baseline covariate $X$ is:
+
+$$
+\theta = \frac{E\{P(A=1\mid L)\,P(A=0\mid L)\,X\}}{E\{P(A=1\mid L)\,P(A=0\mid L)\}}.
+$$
+
+The efficient influence function of $\theta$ is:
+
+$$
+\Phi(\theta) = -\frac{\bigl[P(A=1\mid L)P(A=0\mid L) + \{1 - 2P(A=1\mid L)\}\{A - P(A=1\mid L)\}\bigr](X - \theta)}{E\{P(A=1\mid L)P(A=0\mid L)\}}.
+$$
+
+**Simplification of the numerator weight.** Let $p = P(A=1\mid L)$. Define:
+
+$$
+\phi(A,L) = p(1-p) + (1-2p)(A-p).
+$$
+
+For $A=1$: $\phi = p(1-p) + (1-2p)(1-p) = (1-p)[p + 1 - 2p] = (1-p)^2$.
+
+For $A=0$: $\phi = p(1-p) + (1-2p)(0-p) = p(1-p) - p(1-2p) = p^2$.
+
+In both cases $\phi(A,L) = (A-p)^2$, so:
+
+$$
+\Phi(\theta) = -\frac{(A - p)^2\,(X - \theta)}{E\{p(1-p)\}}.
+$$
+
+**Debiased estimator.** Setting $E[\Phi(\theta)] = 0$ and solving:
+
+$$
+\hat\theta = \frac{\sum_{i=1}^n (A_i - \hat\pi_i)^2\,X_i}{\sum_{i=1}^n (A_i - \hat\pi_i)^2},
+\qquad
+\widehat{\mathrm{SE}}(\hat\theta) = \frac{1}{\sqrt{n}}\,\mathrm{sd}\!\left(\frac{(A_i - \hat\pi_i)^2\,(X_i - \hat\theta)}{mean(\hat\pi(1-\hat\pi))}\right).
+$$
+
+---
+
+### A.6 Risk Ratio 
+
+We rely on Assumption-Lean log-linear regression with the working model:
+$$
+\log E\!\left[Y^a \mid L\right] = \alpha(L) + \beta a.
+$$
+
+For a binary exposure $A \in \{0,1\}$, setting $a = 1$ and $a = 0$ respectively and taking the difference:
+$$
+\begin{aligned}
+\beta &= \log E\!\left[Y^1 \mid L\right] - \log E\!\left[Y^0 \mid L\right] \\
+      &= \log\!\left(\frac{E\!\left[Y^1 \mid L\right]}{E\!\left[Y^0 \mid L\right]}\right) \\
+      &= \log(\mathrm{RR}),
+\end{aligned}
+$$
+which leads to
+$$
+\mathrm{RR} = e^{\beta}.
+$$
+
+Under standard causal assumptions, $E[Y^a \mid L] = E[Y \mid A = a, L]$, so the risk ratio is identified from observed data. A 95% confidence interval on the risk ratio scale is obtained by exponentiating the interval on the log scale:
+$$
+\mathrm{CI}_{\mathrm{RR}} = \left(e^{\hat\beta - 1.96\,\widehat{\mathrm{SE}}},\; e^{\hat\beta + 1.96\,\widehat{\mathrm{SE}}}\right).
+$$
+
+---
+
+### A.7 Conditional Odds Ratio 
+
+We rely on Assumption-Lean logistic regression with the working model:
+$$
+\operatorname{logit} E\!\left[Y^a \mid L\right] = \alpha(L) + \beta a.
+$$
+
+For a binary exposure $A \in \{0,1\}$, setting $a = 1$ and $a = 0$ respectively and taking the difference:
+$$
+\begin{aligned}
+\beta &= \operatorname{logit} E\!\left[Y^1 \mid L\right] - \operatorname{logit} E\!\left[Y^0 \mid L\right] \\
+      &= \log \operatorname{odds}(Y = 1 \mid A = 1, L) - \log \operatorname{odds}(Y = 1 \mid A = 0, L) \\
+      &= \log\!\left(\frac{\operatorname{odds}(Y = 1 \mid A = 1, L)}{\operatorname{odds}(Y = 1 \mid A = 0, L)}\right),
+\end{aligned}
+$$
+which leads to the **conditional** odds ratio (conditional on $L$):
+$$
+\mathrm{OR}(L) = \frac{\operatorname{odds}(Y = 1 \mid A = 1, L)}{\operatorname{odds}(Y = 1 \mid A = 0, L)} = e^{\beta}.
+$$
+
