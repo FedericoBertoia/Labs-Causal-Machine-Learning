@@ -1,8 +1,20 @@
 # ==============================================================================
-# Causal Machine Learning – Project Solution
+# Project: Causal Machine Learning
 # 401(k) Eligibility and Participation on Accumulated Assets
-# Stijn Vansteelandt and Federico Bertoia, Ghent University 2025-2026
+# Stijn Vansteelandt and Federico Bertoia, Ghent University
 # ==============================================================================
+#
+# This script analyses the effect of 401(k) eligibility (e401) on net financial
+# assets (net_tfa) using 9,915 household-level observations from the Survey of
+# Income and Program Participation. All analyses use debiased / targeted machine
+# learning with 5- or 10-fold cross-fitting and a SuperLearner ensemble.
+#
+# Variables:
+#   net_tfa  : Outcome Y   - Net total financial assets ($)
+#   e401     : Treatment A - 401(k) eligibility (binary)
+#   age, inc, fsize, educ, marr, twoearn, pira, db, hown : Confounders L
+# ==============================================================================
+
 
 # ── Packages ───────────────────────────────────────────────────────────────────
 library(hdm)
@@ -13,6 +25,7 @@ library(grf)
 library(SuperLearner)
 library(sandwich)
 library(lmtest)
+library(igraph)
 
 # ── Reproducibility ────────────────────────────────────────────────────────────
 set.seed(123)
@@ -20,41 +33,37 @@ set.seed(123)
 # ── Load data ──────────────────────────────────────────────────────────────────
 data(pension)
 
-# Variable roles:
-#   Y  = net_tfa   (net financial assets, continuous outcome)
-#   A  = p401      (401(k) participation, binary treatment — Tasks 1-3)
-#   A2 = e401      (401(k) eligibility,   binary treatment — main focus)
-#   L  = age, inc, fsize, educ, marr, twoearn, pira, db, hown
-
-glimpse(pension)
-
 # ── Data preparation ───────────────────────────────────────────────────────────
 df <- pension %>%
   transmute(
-    Y      = net_tfa,
-    A      = e401,                  # eligibility (main treatment)
-    age    = age,
-    inc    = inc,
-    fsize  = fsize,
-    educ   = educ,
-    marr   = marr,
+    Y       = net_tfa,
+    A       = e401,
+    age     = age,
+    inc     = inc,
+    fsize   = fsize,
+    educ    = educ,
+    marr    = marr,
     twoearn = twoearn,
     pira    = pira,
     db      = db,
     hown    = hown
   )
 
-# Covariates matrix (used throughout)
 L_vars <- c("age", "inc", "fsize", "educ", "marr", "twoearn",
             "pira", "db", "hown")
 
-X <- df %>% dplyr::select(all_of(L_vars)) %>% as.matrix()
+X <- df %>% dplyr::select(all_of(L_vars)) %>% as.data.frame()
 Y <- df$Y
 A <- df$A
 n <- nrow(df)
 
-stopifnot(all(colSums(is.na(df)) == 0))
-cat("n =", n, " | E[Y] =", round(mean(Y)), " | P(A=1) =", round(mean(A), 3), "\n")
+# ── SuperLearner library ──────────────────────────────────────────────────────
+SL.library <- c("SL.mean", "SL.glm", "SL.ranger", "SL.gam", "SL.earth")
+
+# ── Cross-fitting folds ───────────────────────────────────────────────────────
+n_folds <- 5
+fold_id <- sample(rep(1:n_folds, length.out = n))
+folds   <- split(seq_len(n), fold_id)
 
 
 # ==============================================================================
@@ -62,260 +71,594 @@ cat("n =", n, " | E[Y] =", round(mean(Y)), " | P(A=1) =", round(mean(A), 3), "\n
 # ==============================================================================
 cat("\n====== Task 1: Causal Forest ======\n")
 
-cf <- causal_forest(
-  X              = X,
-  Y              = Y,
-  W              = A,
-  num.trees      = 2000,
-  tune.parameters = "all",
-  seed           = 123
+# ── 1.1 DAG ───────────────────────────────────────────────────────────────────
+dag_edges <- rbind(
+  c("L", "I"),
+  c("I", "E"),
+  c("I", "Y"),
+  c("E", "P"),
+  c("P", "Y"),
+  c("L", "P"),
+  c("L", "Y"),
+  c("U", "P"),
+  c("U", "Y")
 )
 
-# Overall ATE
-ate_cf <- average_treatment_effect(cf, target.sample = "all")
-cat("ATE (causal forest):", round(ate_cf["estimate"]), "\n")
-cat("95% CI: [",
-    round(ate_cf["estimate"] - 1.96 * ate_cf["std.err"]),
-    ",",
-    round(ate_cf["estimate"] + 1.96 * ate_cf["std.err"]), "]\n")
+g <- graph_from_edgelist(dag_edges, directed = TRUE)
 
-# CATE predictions
-tau_hat <- predict(cf)$predictions
+layout_dag <- rbind(
+  E = c(0.0,  0),
+  P = c(1.0,  0),
+  Y = c(2.0,  0),
+  L = c(0.0,  1),
+  I = c(1.0,  1),
+  U = c(1.5, -1)
+)[V(g)$name, ]
 
-# (a) Informative visual: histogram of CATE + scatter CATE vs income
-p1 <- ggplot(data.frame(cate = tau_hat), aes(x = cate)) +
-  geom_histogram(fill = "steelblue", alpha = 0.7, bins = 60) +
-  geom_vline(xintercept = ate_cf["estimate"], colour = "tomato",
-             linetype = "dashed", linewidth = 0.9) +
-  theme_minimal() +
-  labs(
-    title    = "Distribution of estimated CATE (causal forest)",
-    subtitle = paste0("ATE = $", round(ate_cf["estimate"]),
-                      "  (red dashed)"),
-    x        = "Estimated CATE ($)",
-    y        = "Count"
+par(mar = c(1, 1, 2, 1))
+plot(
+  g,
+  layout             = layout_dag,
+  vertex.color       = ifelse(V(g)$name == "U", "grey85", "steelblue"),
+  vertex.label.color = ifelse(V(g)$name == "U", "grey30", "white"),
+  vertex.label.cex   = 1.1,
+  vertex.label.font  = 2,
+  vertex.size        = 30,
+  vertex.frame.color = ifelse(V(g)$name == "U", "grey50", "steelblue4"),
+  edge.arrow.size    = 0.5,
+  edge.color         = "gray30",
+  edge.width         = 2,
+  main               = "Observational DAG"
+)
+# Legend: E = eligibility; P = participation; Y = net financial assets;
+#         I = income; L = other covariates; U = unobserved saving preferences
+
+
+# ── 1.2 Causal forest estimation ──────────────────────────────────────────────
+tau_hat <- numeric(n)
+
+for (k in 1:n_folds) {
+  test  <- folds[[k]]
+  train <- setdiff(seq_len(n), test)
+  
+  cf <- causal_forest(
+    X               = X[train,],
+    Y               = Y[train],
+    W               = A[train],
+    num.trees       = 4000,
+    tune.parameters = "all",
+    seed            = 123
   )
+  
+  tau_hat[test] <- predict(cf, X[test,], estimate.variance = TRUE)$predictions
+}
+
+# Overall ATE via GRF's internal honesty-based variance
+ate_cf <- average_treatment_effect(cf, target.sample = "all", method = "AIPW")
+cat(sprintf("ATE (causal forest): $%.0f  [%.0f, %.0f]\n",
+            ate_cf["estimate"],
+            ate_cf["estimate"] - 1.96 * ate_cf["std.err"],
+            ate_cf["estimate"] + 1.96 * ate_cf["std.err"]))
 
 
+# ── 1.3 Cross-fitted AIPW nuisances ───────────────────────────────────────────
+pi_hat  <- numeric(n)
+mu0_hat <- numeric(n)
+mu1_hat <- numeric(n)
 
-print(p1)
+for (k in 1:n_folds) {
+  test  <- folds[[k]]
+  train <- setdiff(seq_len(n), test)
+  
+  sl_pi <- SuperLearner(
+    Y          = A[train],
+    X          = X[train, ],
+    SL.library = SL.library,
+    family     = binomial(),
+    method     = "method.NNLS",
+    cvControl  = list(V = 5)
+  )
+  sl_mu <- SuperLearner(
+    Y          = Y[train],
+    X          = data.frame(A = A[train], X[train, ]),
+    SL.library = SL.library,
+    family     = gaussian(),
+    method     = "method.NNLS",
+    cvControl  = list(V = 5)
+  )
+  
+  pi_hat[test]  <- predict(sl_pi, newdata = X[test, ])$pred
+  mu1_hat[test] <- predict(sl_mu, newdata = data.frame(A = 1, X[test, ]))$pred
+  mu0_hat[test] <- predict(sl_mu, newdata = data.frame(A = 0, X[test, ]))$pred
+}
 
-# (b) Conditioning on additional variables beyond income
-# Conditioning on extra variables does NOT invalidate identification.
-# Under the assumption that eligibility is exchangeable conditional on income,
-# any superset of {income} is also sufficient (monotonicity of conditional
-# independence). Formally, if A ⊥⊥ Y^a | income, then
-# A ⊥⊥ Y^a | (income, age, ...) as well, because the additional variables
-# cannot introduce new confounding that was already blocked by income.
-# In a causal diagram, controlling for more pre-treatment covariates that are
-# not colliders is always safe and can improve efficiency by reducing residual
-# variance (regression adjustment). Hence the causal forest that conditions on
-# all nine covariates is valid.
-cat("\n[Task 1b] See written explanation above (in-code comment).\n")
+aug_1    <-  A      * (Y - mu1_hat) / pi_hat
+aug_0    <- (1 - A) * (Y - mu0_hat) / (1 - pi_hat)
+psi_i    <- (mu1_hat - mu0_hat) + aug_1 - aug_0
+ate_aipw <- mean(psi_i)
+se_aipw  <- sd(psi_i) / sqrt(n)
+ci_aipw  <- ate_aipw + c(-1, 1) * 1.96 * se_aipw
+
+cat(sprintf("AIPW ATE (cross-fitting): $%.0f  [%.0f, %.0f]\n",
+            ate_aipw, ci_aipw[1], ci_aipw[2]))
+
+
+# ── 1.4 Visualisations ────────────────────────────────────────────────────────
+
+# CATE histogram from the causal forest
+print(
+  ggplot(data.frame(cate = tau_hat), aes(x = cate)) +
+    geom_histogram(fill = "steelblue", alpha = 0.7, bins = 60) +
+    geom_vline(xintercept = ate_cf["estimate"],
+               colour = "tomato", linetype = "dashed", linewidth = 0.9) +
+    theme_minimal() +
+    labs(
+      title    = "Distribution of estimated CATE (causal forest)",
+      subtitle = paste0("ATE = $", round(ate_cf["estimate"]), "  (red dashed)"),
+      x        = "Estimated CATE ($)",
+      y        = "Count"
+    )
+)
+
+# Propensity score overlap and inverse weight distributions
+p_ps <- data.frame(
+  pi_hat = pi_hat,
+  A      = factor(A, labels = c("Not eligible", "Eligible"))
+) %>%
+  ggplot(aes(x = pi_hat, fill = A, color = A)) +
+  geom_density(alpha = 0.3, linewidth = 0.8) +
+  scale_fill_manual(values  = c("steelblue", "tomato")) +
+  scale_color_manual(values = c("steelblue", "tomato")) +
+  theme_minimal() +
+  labs(x     = expression(hat(pi)(L)),
+       y     = "Density",
+       fill  = "401(k) eligibility",
+       color = "401(k) eligibility",
+       title = "Propensity score overlap")
+
+p_wt <- data.frame(
+  weight = c(1 / pi_hat[A == 1], 1 / (1 - pi_hat[A == 0])),
+  A      = factor(c(rep(1, sum(A == 1)), rep(0, sum(A == 0))),
+                  labels = c("Not eligible", "Eligible"))
+) %>%
+  ggplot(aes(x = A, y = weight, fill = A)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = 21) +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  theme_minimal() +
+  labs(x = NULL, y = "Inverse weight", fill = NULL,
+       title = "Inverse weight distribution")
+
+print(p_ps + p_wt)
 
 
 # ==============================================================================
-# Task 2 – Subgroup analysis using ntile
+# Task 2 – Subgroup Analysis
 # ==============================================================================
 cat("\n====== Task 2: Subgroup Analysis ======\n")
 
-df2 <- df %>%
+# ── 2.1 ATE in each subgroup (nuisances re-fit within each subgroup) ──────────
+subgroup_id      <- ntile(tau_hat, 4)
+subgroup_results <- vector("list", 4)
+
+for (g in 1:4) {
+  idx <- which(subgroup_id == g)
+  ng  <- length(idx)
+  Yg  <- Y[idx]; Ag <- A[idx]; Xg <- X[idx, ]
+  
+  fold_id_g <- sample(rep(1:n_folds, length.out = ng))
+  folds_g   <- split(seq_len(ng), fold_id_g)
+  
+  pi_g  <- numeric(ng)
+  mu1_g <- numeric(ng)
+  mu0_g <- numeric(ng)
+  
+  for (k in 1:n_folds) {
+    test_g  <- folds_g[[k]]
+    train_g <- setdiff(seq_len(ng), test_g)
+    
+    sl_pi_g <- SuperLearner(
+      Y          = Ag[train_g],
+      X          = Xg[train_g, ],
+      SL.library = SL.library,
+      family     = binomial(),
+      method     = "method.NNLS",
+      cvControl  = list(V = 5)
+    )
+    sl_mu_g <- SuperLearner(
+      Y          = Yg[train_g],
+      X          = data.frame(A = Ag[train_g], Xg[train_g, ]),
+      SL.library = SL.library,
+      family     = gaussian(),
+      method     = "method.NNLS",
+      cvControl  = list(V = 5)
+    )
+    
+    mu1_g[test_g] <- predict(sl_mu_g,
+                             newdata = data.frame(A = 1, Xg[test_g, ]))$pred
+    mu0_g[test_g] <- predict(sl_mu_g,
+                             newdata = data.frame(A = 0, Xg[test_g, ]))$pred
+    pi_g[test_g]  <- predict(sl_pi_g, newdata = Xg[test_g, ])$pred
+  }
+  
+  psi_g <- (mu1_g - mu0_g) +
+    Ag * (Yg - mu1_g) / pi_g -
+    (1 - Ag) * (Yg - mu0_g) / (1 - pi_g)
+  
+  subgroup_results[[g]] <- data.frame(
+    subgroup = g,
+    n        = ng,
+    ate      = mean(psi_g),
+    se       = sd(psi_g) / sqrt(ng)
+  )
+}
+
+subgroup_results <- bind_rows(subgroup_results) %>%
+  mutate(ci_lo = ate - 1.96 * se,
+         ci_hi = ate + 1.96 * se)
+
+print(subgroup_results %>% mutate(across(c(ate, se, ci_lo, ci_hi), round)))
+
+print(
+  ggplot(subgroup_results,
+         aes(x = factor(subgroup), y = ate, ymin = ci_lo, ymax = ci_hi)) +
+    geom_col(fill = "steelblue", alpha = 0.7, width = 0.5) +
+    geom_errorbar(width = 0.2, colour = "navy") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    theme_minimal() +
+    labs(
+      title   = "Average effect of 401(k) eligibility by CATE subgroup (AIPW)",
+      x       = "Subgroup (1 = lowest predicted CATE, 4 = highest)",
+      y       = "Estimated ATE ($)",
+      caption = "Error bars: 95% CIs. Nuisances re-fit within each subgroup."
+    )
+)
+
+
+# ── 2.2 Alternative: reuse Task 1 full-sample nuisances ───────────────────────
+#
+# The subgroup ATEs above refit nuisances within each subgroup. An alternative
+# is to reuse the cross-fitted nuisances from Task 1 and simply average the
+# AIPW EIF psi_i within subgroups. This is more efficient when the full-sample
+# nuisance models are well-specified, since they pool information across
+# subgroups.
+
+# Subgroup membership: quartile of out-of-bag CATE from causal forest (Task 1)
+subgroup_id <- ntile(tau_hat, 4)
+
+# AIPW EIF computed once on the full sample (Task 1 nuisances)
+psi_full <- (mu1_hat - mu0_hat) +
+  A * (Y - mu1_hat) / pi_hat -
+  (1 - A) * (Y - mu0_hat) / (1 - pi_hat)
+
+# Subgroup-specific ATEs as conditional means of psi_full
+subgroup_results_reuse <- data.frame(subgroup = 1:4) %>%
+  rowwise() %>%
   mutate(
-    subgroup = ntile(tau_hat, 4),
-    tau_hat  = tau_hat
-  )
+    idx = list(which(subgroup_id == subgroup)),
+    n   = length(idx),
+    ate = mean(psi_full[idx]),
+    se  = sd(psi_full[idx]) / sqrt(n)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    ci_lo = ate - 1.96 * se,
+    ci_hi = ate + 1.96 * se
+  ) %>%
+  dplyr::select(-idx)
 
-# 5-fold cross-fitting ATE within each subgroup via AIPW-style DR estimator
-# We reuse the causal forest's nuisance estimates (mu_hat, e_hat) for simplicity;
-# for a fully cross-fit subgroup estimate we re-run on the full sample.
-mu1_hat <- predict(cf, estimate.variance = FALSE)$predictions +
-  (1 - cf$W.orig) * 0    # placeholder; use DR scores below
+print(subgroup_results_reuse %>% mutate(across(c(ate, se, ci_lo, ci_hi), round)))
 
-# DR (AIPW) scores from the forest
-dr_scores <- get_scores(cf)   # = tau_hat_i + (A_i/e - (1-A_i)/(1-e)) * resid_i
+print(
+  ggplot(subgroup_results_reuse,
+         aes(x = factor(subgroup), y = ate, ymin = ci_lo, ymax = ci_hi)) +
+    geom_col(fill = "steelblue", alpha = 0.7, width = 0.5) +
+    geom_errorbar(width = 0.2, colour = "navy") +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    theme_minimal() +
+    labs(
+      title   = "Average effect of 401(k) eligibility by CATE subgroup (AIPW)",
+      x       = "Subgroup (1 = lowest predicted CATE, 4 = highest)",
+      y       = "Estimated ATE ($)",
+      caption = "Error bars: 95% CIs. Nuisances reused from Task 1 (full-sample cross-fitting)."
+    )
+)
 
-# Forest-based DR score: already debiased individual-level score
-# Subgroup ATE = mean of DR scores in that subgroup
-subgroup_results <- df2 %>%
-  mutate(dr = dr_scores) %>%
-  group_by(subgroup) %>%
-  summarise(
-    n      = n(),
-    ate    = mean(dr),
-    se     = sd(dr) / sqrt(n()),
-    ci_lo  = ate - 1.96 * se,
-    ci_hi  = ate + 1.96 * se,
-    .groups = "drop"
-  )
 
-print(subgroup_results)
+# ── Comparison: subgroup-refit vs full-sample nuisance approaches ─────────────
+comparison <- bind_rows(
+  subgroup_results       %>% mutate(method = "Subgroup-refit nuisances"),
+  subgroup_results_reuse %>% mutate(method = "Task 1 full-sample nuisances")
+)
 
-# Visual
-ggplot(subgroup_results,
-       aes(x = factor(subgroup), y = ate, ymin = ci_lo, ymax = ci_hi)) +
-  geom_col(fill = "steelblue", alpha = 0.7, width = 0.5) +
-  geom_errorbar(width = 0.2, colour = "navy") +
-  geom_hline(yintercept = 0, linetype = "dashed") +
-  theme_minimal() +
-  labs(
-    title = "Average effect of 401(k) eligibility by CATE subgroup",
-    x     = "Subgroup (1 = lowest predicted CATE, 4 = highest)",
-    y     = "Estimated ATE ($)",
-    caption = "Error bars: 95% confidence intervals"
-  )
+print(
+  ggplot(comparison,
+         aes(x = factor(subgroup), y = ate, ymin = ci_lo, ymax = ci_hi,
+             colour = method)) +
+    geom_point(position = position_dodge(width = 0.4), size = 3) +
+    geom_errorbar(position = position_dodge(width = 0.4),
+                  width = 0.2, linewidth = 0.8) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    scale_colour_manual(values = c("Subgroup-refit nuisances" = "steelblue",
+                                   "Task 1 full-sample nuisances" = "darkorange")) +
+    theme_minimal() +
+    labs(
+      title  = "Subgroup ATEs: two cross-fitting strategies",
+      x      = "Subgroup",
+      y      = "Estimated ATE ($)",
+      colour = NULL
+    )
+)
 
 
 # ==============================================================================
-# Task 3 – Test of effect heterogeneity: Var[E(Y^1 - Y^0 | L)]
+# Task 3 – Test for Effect Heterogeneity: Var[E(Y^1 - Y^0 | L)]
 # ==============================================================================
 cat("\n====== Task 3: Variance of CATE ======\n")
 
-# Efficient influence function:
-#   phi_i = (tau_hat_i - ate)^2 - sigma2
-#           + 2*(tau_hat_i - ate) * (A_i/e_i - (1-A_i)/(1-e_i)) * (Y_i - mu_hat_i)
+# EIF for sigma^2 = Var[tau(L)]:
 #
-# where:
-#   tau_hat_i = E[Y^1 - Y^0 | L_i]   (predicted CATE)
-#   ate       = E[Y^1 - Y^0]          (estimated ATE)
-#   e_i       = P(A=1 | L_i)          (propensity score)
-#   mu_hat_i  = E[Y | A_i, L_i]       (outcome regression)
+#   phi_i = (tau_hat_i - ATE)^2 - sigma^2
+#           + 2*(tau_hat_i - ATE) * [ A_i*(Y_i - mu1_i)/pi_i
+#                                   - (1-A_i)*(Y_i - mu0_i)/(1-pi_i) ]
+#
+# tau_hat  : out-of-bag CATE from causal forest (Task 1)
+# ate_aipw : ATE from cross-fit AIPW (Task 1)
+# pi_hat, mu1_hat, mu0_hat : cross-fit nuisances from Task 1
 
-ate_val  <- ate_cf["estimate"]
-e_hat    <- cf$W.hat          # propensity scores from forest
-mu_hat   <- cf$Y.hat +        # E[Y|L], need E[Y|A,L]
-  A * (predict(cf)$predictions) * (1 - e_hat) -
-  (1 - A) * (predict(cf)$predictions) * e_hat
-# Simpler: reconstruct E[Y|A,L] from forest components
-# E[Y|A=1,L] = E[Y|L] + (1-e)*tau_hat
-# E[Y|A=0,L] = E[Y|L] - e*tau_hat
-mu_hat_full <- cf$Y.hat + (A - e_hat) * tau_hat / (e_hat * (1 - e_hat)) * 0
-# Use forest residuals directly
-resid_Y <- Y - cf$Y.hat - (A - e_hat) * tau_hat   # approx residual
+aug_diff <- A * (Y - mu1_hat) / pi_hat - (1 - A) * (Y - mu0_hat) / (1 - pi_hat)
 
-# IPW augmentation term
-ipw_term <- (A / e_hat - (1 - A) / (1 - e_hat)) * (Y - cf$Y.hat)
-
-# EIF for sigma^2
-eif_sigma2 <- (tau_hat - ate_val)^2 +
-  2 * (tau_hat - ate_val) * ipw_term
+eif_sigma2 <- (tau_hat - ate_aipw)^2 + 2 * (tau_hat - ate_aipw) * aug_diff
 
 sigma2_hat <- mean(eif_sigma2)
 se_sigma2  <- sd(eif_sigma2) / sqrt(n)
 ci_sigma2  <- sigma2_hat + c(-1, 1) * 1.96 * se_sigma2
 
-cat("Estimated Var[E(Y^1-Y^0|L)]:", round(sigma2_hat), "\n")
-cat("95% CI: [", round(ci_sigma2[1]), ",", round(ci_sigma2[2]), "]\n")
-cat("SD of CATE (sqrt of estimate):", round(sqrt(max(sigma2_hat, 0))), "\n")
+cat(sprintf("Var[tau(L)] estimate : %.2f\n",  sigma2_hat))
+cat(sprintf("95%% CI              : [%.2f, %.2f]\n", ci_sigma2[1], ci_sigma2[2]))
+cat(sprintf("SD of CATE (sqrt)    : $%.0f\n", sqrt(max(sigma2_hat, 0))))
 
-# Interpretation: if CI excludes 0, strong evidence of effect heterogeneity.
-
-
-# ==============================================================================
-# Task 4 – Orthogonal learner: CATE conditional on income only
-# ==============================================================================
-cat("\n====== Task 4: Orthogonal Learner (CATE on income) ======\n")
-
-# We use a partially linear / Robinson-style orthogonal learner:
-#   Y_i - E[Y|A_i,L_i] = tau(income_i) * (A_i - E[A|L_i]) + epsilon_i
-# but we want tau to depend only on income. We achieve this via a
-# local linear / kernel-weighted DML estimator, or more simply by using
-# the DR scores and smoothing them over income.
-#
-# Approach: use the forest's DR scores and regress them nonparametrically
-# on income using a local polynomial / GAM. This is the "R-learner" idea
-# of Nie & Wager (2021).
-
-# Step 1: obtain cross-fit nuisance estimates (already done via causal_forest)
-#   e_hat  = cf$W.hat
-#   m_hat  = cf$Y.hat
-
-# Step 2: construct pseudo-outcome (Robinson residuals)
-#   R-learner pseudo-outcome: dr_score_i (already in dr_scores above)
-#   Or equivalently: (Y_i - m_hat_i) / (A_i - e_hat_i)  [when denominator != 0]
-
-# Step 3: smooth dr_scores over income using a GAM / loess
-# This gives tau(income) = E[DR_score | income]
-
-library(mgcv)
-
-income_grid <- seq(min(df$income), quantile(df$income, 0.99), length.out = 300)
-
-# GAM with penalised spline on income
-gam_fit <- gam(dr_scores ~ s(income, bs = "cr", k = 15),
-               data  = data.frame(income = df$income, dr_scores = dr_scores),
-               method = "REML")
-
-tau_income      <- predict(gam_fit, newdata = data.frame(income = income_grid),
-                           se.fit = TRUE)
-tau_income_est  <- tau_income$fit
-tau_income_se   <- tau_income$se.fit
-
-# Plot
-plot_df <- data.frame(
-  income  = income_grid,
-  tau     = tau_income_est,
-  ci_lo   = tau_income_est - 1.96 * tau_income_se,
-  ci_hi   = tau_income_est + 1.96 * tau_income_se
+print(
+  ggplot(
+    data.frame(est = sigma2_hat, lo = ci_sigma2[1], hi = ci_sigma2[2]),
+    aes(y = 1, x = est, xmin = lo, xmax = hi)
+  ) +
+    geom_point(size = 4, colour = "steelblue") +
+    geom_errorbarh(height = 0.15, colour = "navy") +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "tomato") +
+    theme_minimal() +
+    theme(axis.text.y = element_blank(), axis.ticks.y = element_blank()) +
+    labs(
+      title   = "Estimated variance of CATE",
+      x       = expression(widehat(Var)[tau(L)]),
+      y       = NULL,
+      caption = "Dashed line at 0 (null of no heterogeneity)."
+    )
 )
 
-ggplot(plot_df, aes(x = income, y = tau)) +
-  geom_ribbon(aes(ymin = ci_lo, ymax = ci_hi), fill = "steelblue", alpha = 0.25) +
-  geom_line(colour = "steelblue", linewidth = 1) +
-  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
-  geom_hline(yintercept = ate_cf["estimate"], linetype = "dotted",
-             colour = "tomato") +
-  theme_minimal() +
-  labs(
-    title    = "Estimated effect of 401(k) eligibility on net financial assets\nconditional on income (R-learner + GAM)",
-    subtitle = "Red dotted line = marginal ATE",
-    x        = "Income ($)",
-    y        = "Estimated CATE ($)",
-    caption  = "Shaded band: pointwise 95% confidence interval"
+
+# ==============================================================================
+# Task 4 – Orthogonal Learners: CATE Conditional on Income
+# DR-Learner and R-Learner with nested cross-fitting (2-outer / 5-inner)
+# ==============================================================================
+cat("\n====== Task 4: Orthogonal Learners (DR + R) ======\n")
+
+# ── 4.1 Nested cross-fitting ──────────────────────────────────────────────────
+n_outer <- 2
+n_inner <- 5
+
+outer_fold_id <- sample(rep(1:n_outer, length.out = n))
+outer_folds   <- split(seq_len(n), outer_fold_id)
+
+Gamma_dr <- numeric(n)   # DR pseudo-outcome
+Gamma_r  <- numeric(n)   # R  pseudo-outcome
+W_r      <- numeric(n)   # R  weights: (A - pi)^2
+tau_dr   <- numeric(n)   # DR-Learner CATE predictions
+tau_r    <- numeric(n)   # R-Learner  CATE predictions
+
+for (outer_k in 1:n_outer) {
+  
+  test_outer  <- outer_folds[[outer_k]]
+  train_outer <- setdiff(seq_len(n), test_outer)
+  n_tr        <- length(train_outer)
+  
+  # ── Inner cross-fitting: nuisances on train_outer ──────────────────────────
+  inner_ids   <- sample(rep(1:n_inner, length.out = n_tr))
+  inner_folds <- split(seq_len(n_tr), inner_ids)
+  
+  pi_inner  <- numeric(n_tr)
+  mu1_inner <- numeric(n_tr)
+  mu0_inner <- numeric(n_tr)
+  m_inner   <- numeric(n_tr)   # E(Y | X), no A — for R-Learner
+  
+  for (inner_k in 1:n_inner) {
+    test_in      <- inner_folds[[inner_k]]
+    train_in     <- setdiff(seq_len(n_tr), test_in)
+    idx_test_in  <- train_outer[test_in]
+    idx_train_in <- train_outer[train_in]
+    
+    sl_pi_in <- SuperLearner(
+      Y          = A[idx_train_in],
+      X          = X[idx_train_in, ],
+      SL.library = SL.library,
+      family     = binomial(),
+      method     = "method.NNLS",
+      cvControl  = list(V = 5)
+    )
+    sl_mu_in <- SuperLearner(
+      Y          = Y[idx_train_in],
+      X          = data.frame(A = A[idx_train_in], X[idx_train_in, ]),
+      SL.library = SL.library,
+      family     = gaussian(),
+      method     = "method.NNLS",
+      cvControl  = list(V = 5)
+    )
+    sl_m_in <- SuperLearner(
+      Y          = Y[idx_train_in],
+      X          = X[idx_train_in, ],
+      SL.library = SL.library,
+      family     = gaussian(),
+      method     = "method.NNLS",
+      cvControl  = list(V = 5)
+    )
+    
+    pi_inner[test_in]  <- predict(sl_pi_in, newdata = X[idx_test_in, ])$pred
+    mu1_inner[test_in] <- predict(sl_mu_in,
+                                  newdata = data.frame(A = 1, X[idx_test_in, ]))$pred
+    mu0_inner[test_in] <- predict(sl_mu_in,
+                                  newdata = data.frame(A = 0, X[idx_test_in, ]))$pred
+    m_inner[test_in]   <- predict(sl_m_in, newdata = X[idx_test_in, ])$pred
+  }
+  
+  # ── Pseudo-outcomes on train_outer ─────────────────────────────────────────
+  A_tr <- A[train_outer]; Y_tr <- Y[train_outer]
+  
+  Gamma_dr_tr <- (mu1_inner - mu0_inner) +
+    A_tr  * (Y_tr - mu1_inner) / pi_inner -
+    (1 - A_tr) * (Y_tr - mu0_inner) / (1 - pi_inner)
+  
+  resid_A_tr <- A_tr - pi_inner
+  resid_Y_tr <- Y_tr - m_inner
+  Gamma_r_tr <- resid_Y_tr / resid_A_tr
+  W_r_tr     <- resid_A_tr^2
+  
+  Gamma_dr[train_outer] <- Gamma_dr_tr
+  Gamma_r[train_outer]  <- Gamma_r_tr
+  W_r[train_outer]      <- W_r_tr
+  
+  # ── Fit SuperLearner on pseudo-outcomes, predict on test_outer ─────────────
+  inc_train <- data.frame(inc = X$inc[train_outer])
+  inc_test  <- data.frame(inc = X$inc[test_outer])
+  
+  sl_dr <- SuperLearner(
+    Y          = Gamma_dr_tr,
+    X          = inc_train,
+    SL.library = SL.library,
+    family     = gaussian(),
+    method     = "method.NNLS",
+    cvControl  = list(V = 5)
   )
+  
+  sl_r <- SuperLearner(
+    Y          = Gamma_r_tr,
+    X          = inc_train,
+    obsWeights  = W_r_tr,
+    SL.library = SL.library,
+    family     = gaussian(),
+    method     = "method.NNLS",
+    cvControl  = list(V = 5)
+  )
+  
+  tau_dr[test_outer] <- predict(sl_dr, newdata = inc_test)$pred
+  tau_r[test_outer]  <- predict(sl_r,  newdata = inc_test)$pred
+}
 
-# (b) Assumptions made by this orthogonal learner vs causal forest
-# The R-learner + GAM imposes the working model tau(income_i) = f(income),
-# i.e. that the CATE depends on income ONLY after conditioning on L for
-# debiasing. The causal forest makes no such restriction and can learn
-# tau(L) flexibly over all nine covariates. The GAM further assumes that
-# the function f is smooth (continuous with bounded second derivative via
-# the penalised spline). The causal forest is fully nonparametric (tree-
-# based) and does not assume smoothness. The key advantage of the
-# orthogonal learner is lower-dimensional visualisation and potentially
-# lower variance when the true CATE is mainly driven by income.
-cat("\n[Task 4b] See in-code comment above.\n")
 
+# ── 4.3 Visualization: refit second stage on full sample, plot tau(inc) ───────
+
+# --- Step 1: Reuse Task 1 nuisances; only need to add m_hat = E[Y | L] ---
+m_hat <- numeric(n)
+
+for (k in 1:n_folds) {
+  test  <- folds[[k]]
+  train <- setdiff(seq_len(n), test)
+  
+  sl_m <- SuperLearner(
+    Y = Y[train], X = X[train, ],
+    SL.library = SL.library, family = gaussian(),
+    method = "method.NNLS", cvControl = list(V = 5)
+  )
+  m_hat[test] <- predict(sl_m, newdata = X[test, ])$pred
+}
+
+# --- Step 2: Build pseudo-outcomes (DR already computed in Task 1 as psi_i) ---
+Gamma_dr_full <- psi_i                       # from Task 1
+
+resid_A      <- A - pi_hat                   # from Task 1
+resid_Y      <- Y - m_hat
+Gamma_r_full <- resid_Y / resid_A
+W_r_full     <- resid_A^2
+
+# --- Step 3: Fit second stage ONCE on the full sample, X = inc only ---
+inc_df <- data.frame(inc = X$inc)
+
+sl_dr_full <- SuperLearner(
+  Y = Gamma_dr_full, X = inc_df,
+  SL.library = SL.library, family = gaussian(),
+  method = "method.NNLS", cvControl = list(V = 5)
+)
+sl_r_full <- SuperLearner(
+  Y = Gamma_r_full, X = inc_df,
+  obsWeights = W_r_full,
+  SL.library = SL.library, family = gaussian(),
+  method = "method.NNLS", cvControl = list(V = 5)
+)
+
+# --- Step 4: Evaluate on a dense grid of income values ---
+inc_grid <- data.frame(
+  inc = seq(min(X$inc), max(X$inc), length.out = 5000)
+)
+tau_dr_grid <- predict(sl_dr_full, newdata = inc_grid)$pred
+tau_r_grid  <- predict(sl_r_full,  newdata = inc_grid)$pred
+
+plot_df <- rbind(
+  data.frame(inc = inc_grid$inc, tau = as.numeric(tau_dr_grid), Learner = "DR-Learner"),
+  data.frame(inc = inc_grid$inc, tau = as.numeric(tau_r_grid),  Learner = "R-Learner")
+)
+
+print(
+  ggplot(plot_df, aes(x = inc, y = tau, colour = Learner)) +
+    geom_line(linewidth = 1.3) +
+    scale_colour_manual(
+      values = c("DR-Learner" = "steelblue", "R-Learner" = "darkorchid")
+    ) +
+    theme_minimal() +
+    labs(
+      title  = "Estimated CATE as a function of income",
+      x      = "Income ($)",
+      y      = expression(hat(tau)(inc)),
+      colour = NULL
+    )
+)
+
+
+
+
+
+# --- Step 4 (weighted spline version): smooth tau(inc) ---
+
+# DR-learner: unweighted (or use 1's if you want to be explicit)
+spl_dr <- smooth.spline(x = X$inc, y = Gamma_dr_full, cv = FALSE)
+
+# R-learner: weighted by (A - pi_hat)^2
+spl_r  <- smooth.spline(x = X$inc, y = Gamma_r_full, w = W_r_full, cv = FALSE)
+
+# Evaluate on a dense grid
+inc_grid <- seq(min(X$inc), max(X$inc), length.out = 500)
+
+tau_dr_grid <- predict(spl_dr, x = inc_grid)$y
+tau_r_grid  <- predict(spl_r,  x = inc_grid)$y
+
+plot_df <- rbind(
+  data.frame(inc = inc_grid, tau = tau_dr_grid, Learner = "DR-Learner"),
+  data.frame(inc = inc_grid, tau = tau_r_grid,  Learner = "R-Learner")
+)
+
+print(
+  ggplot(plot_df, aes(x = inc, y = tau, colour = Learner)) +
+    geom_line(linewidth = 1.3) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+    scale_colour_manual(values = c("DR-Learner" = "steelblue",
+                                   "R-Learner"  = "darkorchid")) +
+    theme_minimal() +
+    labs(
+      title  = "Estimated CATE as a function of income (weighted smoothing spline)",
+      x      = "Income ($)",
+      y      = expression(hat(tau)(inc)),
+      colour = NULL
+    )
+)
 
 # ==============================================================================
-# Diagnostics / Quality Checks (required by the project instructions)
+# Session Info
 # ==============================================================================
-cat("\n====== Diagnostics ======\n")
-
-# 1. Propensity score distribution (positivity)
-ps_df <- data.frame(e_hat = e_hat, A = factor(A))
-ggplot(ps_df, aes(x = e_hat, fill = A, colour = A)) +
-  geom_density(alpha = 0.3, linewidth = 0.8) +
-  scale_fill_manual(values  = c("steelblue", "tomato"),
-                    labels  = c("Not eligible", "Eligible")) +
-  scale_colour_manual(values = c("steelblue", "tomato"),
-                      labels = c("Not eligible", "Eligible")) +
-  theme_minimal() +
-  labs(title    = "Propensity score distribution by eligibility",
-       subtitle = "Substantial overlap supports positivity",
-       x = "P(Eligible | L)", y = "Density",
-       fill = "Eligibility", colour = "Eligibility")
-
-cat("Propensity score range: [", round(min(e_hat), 3), ",",
-    round(max(e_hat), 3), "]\n")
-cat("Proportion with e < 0.05 or e > 0.95:",
-    round(mean(e_hat < 0.05 | e_hat > 0.95), 4), "\n")
-
-# 2. Influence function extremes (Task 3)
-cat("DR score: mean =", round(mean(dr_scores)),
-    " | SD =", round(sd(dr_scores)),
-    " | max |DR| =", round(max(abs(dr_scores))), "\n")
-
-# 3. Forest calibration test
-test_calibration(cf)
-
-cat("\n====== Done ======\n")
+sessionInfo()
