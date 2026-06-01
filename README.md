@@ -6,6 +6,8 @@ core toolkit of modern causal inference — from flexible nuisance estimation wi
 **Super Learner** to **doubly-robust** estimation of treatment effects, **mediation**,
 **instrumental variables**, and **assumption-lean inference**.
 
+📄 **Course description:** [UGent study guide — Causal Machine Learning (C004413)](https://studiekiezer.ugent.be/2025/studiefiche/en/C004413)
+
 ---
 
 ## 🧪 Labs
